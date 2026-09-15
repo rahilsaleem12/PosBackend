@@ -28,4 +28,4 @@ EOF
 
 COPY ./Publish .
 EXPOSE 8080
-ENTRYPOINT ["dotnet", "POS.API.dll"]
+ENTRYPOINT ["sh", "-c", "ASPNETCORE_URLS=http://+:${PORT:-8080} dotnet POS.API.dll"]
