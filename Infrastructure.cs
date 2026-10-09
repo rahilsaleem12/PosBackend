@@ -40,6 +40,7 @@ namespace POS.Infrastructure.Data
         public DbSet<Customer> Customers { get; set; }
         public DbSet<CustomerLedger> CustomerLedgers { get; set; }
         public DbSet<RestaurantTable> RestaurantTables { get; set; }
+        public DbSet<SalesAgent> SalesAgents { get; set; }
         public DbSet<Order> Orders { get; set; }
         public DbSet<OrderItem> OrderItems { get; set; }
         public DbSet<OrderPayment> OrderPayments { get; set; }
@@ -63,6 +64,20 @@ namespace POS.Infrastructure.Data
             modelBuilder.Entity<Purchase>()
                 .HasIndex(p => p.PurchaseNumber)
                 .IsUnique();
+
+            modelBuilder.Entity<SalesAgent>(e =>
+            {
+                e.Property(a => a.Name).HasMaxLength(100).IsRequired();
+                e.Property(a => a.Phone).HasMaxLength(30);
+                e.Property(a => a.AgentType).HasMaxLength(20).IsRequired();
+                e.HasIndex(a => new { a.BranchId, a.AgentType });
+            });
+
+            modelBuilder.Entity<Order>()
+                .HasOne(o => o.Agent)
+                .WithMany()
+                .HasForeignKey(o => o.AgentId)
+                .OnDelete(DeleteBehavior.NoAction);
 
             // Set decimal precision for all decimal properties
             foreach (var property in modelBuilder.Model.GetEntityTypes()
@@ -325,6 +340,16 @@ namespace POS.Infrastructure.Services
                     Notes = dto.Notes,
                     Status = "Pending"
                 };
+
+                // Waiter (Dine In) / Rider (Delivery): agent aur uska fixed commission order par save hota hai
+                if (dto.AgentId.HasValue && dto.OrderType != "Takeaway")
+                {
+                    var agent = await _db.SalesAgents.FirstOrDefaultAsync(a =>
+                        a.Id == dto.AgentId.Value && a.BranchId == branchId && a.IsActive)
+                        ?? throw new Exception("Selected waiter/rider not found");
+                    order.AgentId = agent.Id;
+                    order.AgentCommission = agent.CommissionAmount;
+                }
 
                 decimal subTotal = 0;
                 decimal totalTax = 0;
@@ -704,6 +729,7 @@ namespace POS.Infrastructure.Services
                 .Include(o => o.Items).ThenInclude(i => i.Product).ThenInclude(p => p!.Category)
                 .Include(o => o.Customer)
                 .Include(o => o.User)
+                .Include(o => o.Agent)
                 .Where(o => o.BranchId == branchId &&
                             o.Status == "Completed" &&
                             o.CompletedAt >= startDate &&
@@ -748,6 +774,16 @@ namespace POS.Infrastructure.Services
                     g.First().Customer?.CurrentBalance ?? 0))
                 .ToList();
 
+            var byAgent = orders
+                .Where(o => o.Agent != null)
+                .GroupBy(o => new { o.Agent!.Id, o.Agent.Name, o.Agent.AgentType })
+                .Select(g => new SalesByAgentDto(
+                    g.Key.Name, g.Key.AgentType, g.Count(),
+                    g.Sum(o => o.TotalAmount),
+                    g.Sum(o => o.AgentCommission)))
+                .OrderByDescending(x => x.Sales)
+                .ToList();
+
             return new SalesReportDto
             {
                 StartDate = startDate,
@@ -760,7 +796,8 @@ namespace POS.Infrastructure.Services
                 ByDate = byDate,
                 ByCategory = byCategory,
                 ByUser = byUser,
-                ByCustomer = byCustomer
+                ByCustomer = byCustomer,
+                ByAgent = byAgent
             };
         }
 

@@ -219,6 +219,16 @@ namespace POS.Core.Entities
         public bool IsActive { get; set; } = true;
     }
 
+    // Sales Agent = Waiter (Dine In) ya Rider (Delivery). Commission fixed amount per order.
+    public class SalesAgent : BaseEntity
+    {
+        public int BranchId { get; set; }
+        public string Name { get; set; } = string.Empty;
+        public string? Phone { get; set; }
+        public string AgentType { get; set; } = "Waiter";   // Waiter | Rider
+        public decimal CommissionAmount { get; set; } = 0;   // fixed amount per completed order
+    }
+
     public class Order
     {
         public long Id { get; set; }
@@ -226,6 +236,8 @@ namespace POS.Core.Entities
         public int? CustomerId { get; set; }
         public int UserId { get; set; }
         public int? TableId { get; set; }
+        public int? AgentId { get; set; }
+        public decimal AgentCommission { get; set; } = 0;   // order ke waqt agent ka commission (snapshot)
         public string OrderNumber { get; set; } = string.Empty;
         public string OrderType { get; set; } = "Takeaway";
         public string Status { get; set; } = "Pending";
@@ -246,6 +258,7 @@ namespace POS.Core.Entities
         public Customer? Customer { get; set; }
         public User? User { get; set; }
         public RestaurantTable? Table { get; set; }
+        public SalesAgent? Agent { get; set; }
         public ICollection<OrderItem> Items { get; set; } = new List<OrderItem>();
         public ICollection<OrderPayment> Payments { get; set; } = new List<OrderPayment>();
     }
@@ -393,6 +406,7 @@ namespace POS.Core.DTOs
     {
         public int? CustomerId { get; set; }
         public int? TableId { get; set; }
+        public int? AgentId { get; set; }
         public string OrderType { get; set; } = "Takeaway";
         public string? DiscountType { get; set; }
         public decimal DiscountValue { get; set; }
@@ -447,12 +461,14 @@ namespace POS.Core.DTOs
         public List<SalesByCategoryDto> ByCategory { get; set; } = new();
         public List<SalesByUserDto> ByUser { get; set; } = new();
         public List<SalesByCustomerDto> ByCustomer { get; set; } = new();
+        public List<SalesByAgentDto> ByAgent { get; set; } = new();
     }
 
     public record SalesByDateDto(DateTime Date, int Orders, decimal Sales, decimal Profit);
     public record SalesByCategoryDto(string Category, int Items, decimal Sales, decimal Profit);
     public record SalesByUserDto(string User, int Orders, decimal Sales);
     public record SalesByCustomerDto(string Customer, int Orders, decimal Sales, decimal Balance);
+    public record SalesByAgentDto(string Agent, string AgentType, int Orders, decimal Sales, decimal Commission);
 
     public class ApiResponse<T>
     {
@@ -471,6 +487,7 @@ namespace POS.Core.DTOs
 
     public record ChangePasswordDto(string OldPassword, string NewPassword);
     public record CategoryDto(string Name, string? Icon, string? Color, int SortOrder);
+    public record SalesAgentDto(string Name, string? Phone, string AgentType, decimal CommissionAmount);
     public record CustomerDto(string Name, string? Phone, string? Email, string? Address, decimal CreditLimit);
     public record CustomerPaymentDto(decimal Amount, string? Notes);
     public record SupplierDto(string Name, string? Company, string? Phone, string? Email, string? Address);

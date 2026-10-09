@@ -370,6 +370,7 @@ namespace POS.API.Controllers
                 .Include(o => o.Customer)
                 .Include(o => o.User)
                 .Include(o => o.Table)
+                .Include(o => o.Agent)
                 .Where(o => o.BranchId == CurrentBranchId);
 
             if (startDate.HasValue) query = query.Where(o => o.CreatedAt >= startDate.Value);
@@ -395,6 +396,7 @@ namespace POS.API.Controllers
                 .Include(o => o.Customer)
                 .Include(o => o.User)
                 .Include(o => o.Table)
+                .Include(o => o.Agent)
                 .FirstOrDefaultAsync(o => o.Id == id && o.BranchId == CurrentBranchId);
 
             if (order == null) return NotFound(ApiResponse<Order>.Fail("Order not found"));
@@ -584,6 +586,101 @@ namespace POS.API.Controllers
             _db.CustomerLedgers.Add(ledger);
             await _db.SaveChangesAsync();
             return Ok(ApiResponse<object>.Ok(null!, "Payment recorded"));
+        }
+    }
+
+    // ============================================
+    // SALES AGENTS CONTROLLER (Waiter / Rider)
+    // ============================================
+    [Authorize]
+    [Route("api/sales-agents")]
+    [ApiController]
+    public class SalesAgentsController : BaseController
+    {
+        private static readonly string[] AgentTypes = { "Waiter", "Rider" };
+        private readonly PosDbContext _db;
+        public SalesAgentsController(PosDbContext db) => _db = db;
+
+        // GET api/sales-agents?type=Waiter|Rider&search=
+        [HttpGet]
+        public async Task<IActionResult> GetAll([FromQuery] string? type = null, [FromQuery] string? search = null)
+        {
+            var query = _db.SalesAgents.Where(a => a.BranchId == CurrentBranchId && a.IsActive);
+
+            if (!string.IsNullOrEmpty(type)) query = query.Where(a => a.AgentType == type);
+            if (!string.IsNullOrEmpty(search))
+                query = query.Where(a => a.Name.Contains(search) || (a.Phone != null && a.Phone.Contains(search)));
+
+            var items = await query.OrderBy(a => a.Name).ToListAsync();
+            return Ok(ApiResponse<IEnumerable<SalesAgent>>.Ok(items));
+        }
+
+        [HttpGet("{id}")]
+        public async Task<IActionResult> GetById(int id)
+        {
+            var a = await _db.SalesAgents.FirstOrDefaultAsync(x => x.Id == id && x.BranchId == CurrentBranchId);
+            return a == null
+                ? NotFound(ApiResponse<SalesAgent>.Fail("Agent not found"))
+                : Ok(ApiResponse<SalesAgent>.Ok(a));
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> Create([FromBody] SalesAgentDto dto)
+        {
+            var error = Validate(dto);
+            if (error != null) return BadRequest(ApiResponse<SalesAgent>.Fail(error));
+
+            var agent = new SalesAgent
+            {
+                BranchId = CurrentBranchId,
+                Name = dto.Name.Trim(),
+                Phone = dto.Phone,
+                AgentType = dto.AgentType,
+                CommissionAmount = dto.CommissionAmount
+            };
+            _db.SalesAgents.Add(agent);
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<SalesAgent>.Ok(agent, "Agent created"));
+        }
+
+        [HttpPut("{id}")]
+        public async Task<IActionResult> Update(int id, [FromBody] SalesAgentDto dto)
+        {
+            var error = Validate(dto);
+            if (error != null) return BadRequest(ApiResponse<SalesAgent>.Fail(error));
+
+            var agent = await _db.SalesAgents.FirstOrDefaultAsync(x => x.Id == id && x.BranchId == CurrentBranchId);
+            if (agent == null) return NotFound(ApiResponse<SalesAgent>.Fail("Agent not found"));
+
+            // Commission change sirf aage ke orders par lagega, purane orders par nahi
+            agent.Name = dto.Name.Trim();
+            agent.Phone = dto.Phone;
+            agent.AgentType = dto.AgentType;
+            agent.CommissionAmount = dto.CommissionAmount;
+            agent.UpdatedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<SalesAgent>.Ok(agent, "Agent updated"));
+        }
+
+        [Authorize(Roles = "Admin,Manager")]
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> Delete(int id)
+        {
+            var agent = await _db.SalesAgents.FirstOrDefaultAsync(x => x.Id == id && x.BranchId == CurrentBranchId);
+            if (agent == null) return NotFound(ApiResponse<SalesAgent>.Fail("Agent not found"));
+
+            agent.IsActive = false;   // soft delete, purani sales ka record bacha rahe
+            agent.UpdatedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<object>.Ok(null!, "Agent deleted"));
+        }
+
+        private static string? Validate(SalesAgentDto dto)
+        {
+            if (string.IsNullOrWhiteSpace(dto.Name)) return "Name is required";
+            if (!AgentTypes.Contains(dto.AgentType)) return "Agent type must be Waiter or Rider";
+            if (dto.CommissionAmount < 0) return "Commission cannot be negative";
+            return null;
         }
     }
 
