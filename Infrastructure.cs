@@ -41,6 +41,9 @@ namespace POS.Infrastructure.Data
         public DbSet<CustomerLedger> CustomerLedgers { get; set; }
         public DbSet<RestaurantTable> RestaurantTables { get; set; }
         public DbSet<SalesAgent> SalesAgents { get; set; }
+        public DbSet<ProductType> ProductTypes { get; set; }
+        public DbSet<ProductComponent> ProductComponents { get; set; }
+        public DbSet<CashRegisterSession> CashRegisterSessions { get; set; }
         public DbSet<Order> Orders { get; set; }
         public DbSet<OrderItem> OrderItems { get; set; }
         public DbSet<OrderPayment> OrderPayments { get; set; }
@@ -79,6 +82,51 @@ namespace POS.Infrastructure.Data
                 .HasForeignKey(o => o.AgentId)
                 .OnDelete(DeleteBehavior.NoAction);
 
+            // Business day (day open / close) — existing CashRegisterSessions table
+            modelBuilder.Entity<CashRegisterSession>(e =>
+            {
+                e.Property(s => s.BusinessDate).HasColumnType("date");
+                e.Property(s => s.Status).HasMaxLength(20).IsRequired();
+                e.Property(s => s.Notes).HasMaxLength(500);
+                e.Property(s => s.CloseNotes).HasMaxLength(500);
+                e.HasIndex(s => new { s.BranchId, s.BusinessDate });
+            });
+
+            modelBuilder.Entity<Order>(e =>
+            {
+                e.Property(o => o.BusinessDate).HasColumnType("date");
+                e.HasIndex(o => o.BusinessDate);
+                e.HasOne<CashRegisterSession>().WithMany()
+                    .HasForeignKey(o => o.BusinessDayId).OnDelete(DeleteBehavior.NoAction);
+            });
+
+            // Product types (Inventory / Recipe / Deal & Combo) — fixed list, no screen for it
+            modelBuilder.Entity<ProductType>(e =>
+            {
+                e.Property(x => x.Id).ValueGeneratedNever();
+                e.Property(x => x.Name).HasMaxLength(50).IsRequired();
+                e.HasIndex(x => x.Name).IsUnique();
+                e.HasData(
+                    new ProductType { Id = ProductTypeIds.Inventory, Name = "Inventory Product" },
+                    new ProductType { Id = ProductTypeIds.Recipe, Name = "Recipe Product" },
+                    new ProductType { Id = ProductTypeIds.Deal, Name = "Deal and Combo" });
+            });
+
+            modelBuilder.Entity<Product>()
+                .HasOne<ProductType>()
+                .WithMany()
+                .HasForeignKey(p => p.ProductTypeId)
+                .OnDelete(DeleteBehavior.NoAction);
+
+            modelBuilder.Entity<ProductComponent>(e =>
+            {
+                e.HasOne<Product>().WithMany(p => p.Components)
+                    .HasForeignKey(x => x.ParentProductId).OnDelete(DeleteBehavior.NoAction);
+                e.HasOne(x => x.ComponentProduct).WithMany()
+                    .HasForeignKey(x => x.ComponentProductId).OnDelete(DeleteBehavior.NoAction);
+                e.HasIndex(x => new { x.ParentProductId, x.ComponentProductId }).IsUnique();
+            });
+
             // Set decimal precision for all decimal properties
             foreach (var property in modelBuilder.Model.GetEntityTypes()
                 .SelectMany(t => t.GetProperties())
@@ -87,6 +135,219 @@ namespace POS.Infrastructure.Data
                 property.SetPrecision(18);
                 property.SetScale(3);
             }
+        }
+    }
+
+    // ============================================
+    // RECIPE / DEAL STOCK HELPER
+    // ============================================
+    public class StockGraph
+    {
+        public Dictionary<int, int> TypeById { get; set; } = new();
+        public Dictionary<int, decimal> StockById { get; set; } = new();
+        public ILookup<int, ProductComponent> Components { get; set; } =
+            Enumerable.Empty<ProductComponent>().ToLookup(c => c.ParentProductId);
+    }
+
+    public static class StockExpander
+    {
+        // Loads product types, stock and recipe/deal rows of a branch (2 small queries)
+        public static async Task<StockGraph> LoadAsync(PosDbContext db, int branchId)
+        {
+            var prods = await db.Products.AsNoTracking()
+                .Where(p => p.BranchId == branchId)
+                .Select(p => new { p.Id, p.ProductTypeId, p.CurrentStock })
+                .ToListAsync();
+
+            var comps = await db.ProductComponents.AsNoTracking()
+                .Where(c => db.Products.Any(p => p.Id == c.ParentProductId && p.BranchId == branchId))
+                .ToListAsync();
+
+            return new StockGraph
+            {
+                TypeById = prods.ToDictionary(p => p.Id, p => p.ProductTypeId),
+                StockById = prods.ToDictionary(p => p.Id, p => p.CurrentStock),
+                Components = comps.ToLookup(c => c.ParentProductId)
+            };
+        }
+
+        // Selling `qty` of a product -> how much of each INVENTORY product is used.
+        // Inventory: itself. Recipe: its ingredients. Deal: its items (recipe items expand to their ingredients).
+        public static void Expand(int productId, decimal qty, StockGraph g, Dictionary<int, decimal> result, int depth = 0)
+        {
+            g.TypeById.TryGetValue(productId, out var type);
+
+            if (type == ProductTypeIds.Recipe || type == ProductTypeIds.Deal)
+            {
+                if (depth > 5) throw new Exception("Recipe/deal nesting is too deep");
+                foreach (var c in g.Components[productId])
+                    Expand(c.ComponentProductId, qty * c.Quantity, g, result, depth + 1);
+                return;
+            }
+
+            result.TryGetValue(productId, out var current);
+            result[productId] = current + qty;
+        }
+
+        // How many units can be made/sold with the stock available right now.
+        // Inventory product: its own stock. Recipe/Deal: limited by its scarcest ingredient.
+        public static decimal Available(int productId, StockGraph g, int depth = 0)
+        {
+            if (depth > 5) return 0;
+            g.TypeById.TryGetValue(productId, out var type);
+
+            if (type != ProductTypeIds.Recipe && type != ProductTypeIds.Deal)
+                return g.StockById.TryGetValue(productId, out var stock) ? stock : 0;
+
+            var rows = g.Components[productId].ToList();
+            if (rows.Count == 0) return 0;
+
+            decimal min = decimal.MaxValue;
+            foreach (var c in rows)
+            {
+                var have = Math.Max(0, Available(c.ComponentProductId, g, depth + 1));
+                var portions = c.Quantity > 0 ? Math.Floor(have / c.Quantity) : 0;
+                if (portions < min) min = portions;
+            }
+            return min == decimal.MaxValue ? 0 : min;
+        }
+    }
+
+    // ============================================
+    // BUSINESS DAY (DAY OPEN / DAY CLOSE) HELPERS
+    // ============================================
+    public static class BusinessTime
+    {
+        // Business time zone (Pakistan). Falls back to a fixed +05:00 zone if the server has no tz database.
+        private static readonly Lazy<TimeZoneInfo> Zone = new(() =>
+        {
+            foreach (var id in new[] { "Asia/Karachi", "Pakistan Standard Time" })
+            {
+                try { return TimeZoneInfo.FindSystemTimeZoneById(id); } catch { }
+            }
+            return TimeZoneInfo.CreateCustomTimeZone("PKT", TimeSpan.FromHours(5), "PKT", "PKT");
+        });
+
+        public static DateTime ToLocal(DateTime utc) =>
+            TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(utc, DateTimeKind.Utc), Zone.Value);
+
+        public static DateTime LocalToday() => ToLocal(DateTime.UtcNow).Date;
+    }
+
+    public class PaymentLine
+    {
+        public string Method { get; set; } = string.Empty;
+        public decimal Amount { get; set; }
+    }
+
+    public class DaySummary
+    {
+        public DateTime Date { get; set; }
+        public decimal TotalSales { get; set; }
+        public int TotalOrders { get; set; }
+        public int CompletedOrders { get; set; }
+        public int VoidedOrders { get; set; }
+        public int OpenOrders { get; set; }          // held / pending orders that are not completed
+        public int TotalItemsSold { get; set; }
+        public decimal AvgOrderValue { get; set; }
+        public decimal CashSales { get; set; }       // cash received minus change given
+        public decimal CardSales { get; set; }
+        public decimal WalletSales { get; set; }
+        public decimal TotalExpenses { get; set; }
+        public decimal NetCash { get; set; }         // cash sales - expenses
+        public decimal OpeningBalance { get; set; }
+        public decimal ExpectedCash { get; set; }    // opening + cash sales - expenses
+        public List<PaymentLine> PaymentBreakdown { get; set; } = new();
+    }
+
+    public static class BusinessDayHelper
+    {
+        public static Task<CashRegisterSession?> GetOpenAsync(PosDbContext db, int branchId) =>
+            db.CashRegisterSessions.FirstOrDefaultAsync(s => s.BranchId == branchId && s.Status == "Open");
+
+        // The day that was running at the given time (works for offline sales that sync later).
+        // If none matches, the day that is open now is used.
+        public static async Task<CashRegisterSession?> ResolveForAsync(PosDbContext db, int branchId, DateTime atUtc)
+        {
+            var match = await db.CashRegisterSessions.AsNoTracking()
+                .Where(s => s.BranchId == branchId && s.OpenedAt <= atUtc && (s.ClosedAt == null || s.ClosedAt >= atUtc))
+                .OrderByDescending(s => s.OpenedAt)
+                .FirstOrDefaultAsync();
+            return match ?? await GetOpenAsync(db, branchId);
+        }
+
+        public static async Task<DateTime> CurrentDateAsync(PosDbContext db, int branchId)
+        {
+            var open = await GetOpenAsync(db, branchId);
+            return open != null ? open.BusinessDate.Date : BusinessTime.LocalToday();
+        }
+
+        public static async Task<DaySummary> BuildSummaryAsync(PosDbContext db, int branchId, DateTime businessDate, CashRegisterSession? session)
+        {
+            var date = businessDate.Date;
+            var orders = await db.Orders.AsNoTracking()
+                .Include(o => o.Payments)
+                .Include(o => o.Items)
+                .Where(o => o.BranchId == branchId && o.BusinessDate == date)
+                .ToListAsync();
+
+            var completed = orders.Where(o => o.Status == "Completed").ToList();
+            var voided = orders.Count(o => o.Status == "Voided");
+            var openOrders = orders.Count(o => o.Status != "Completed" && o.Status != "Voided");
+
+            var payments = completed.SelectMany(o => o.Payments).ToList();
+            var change = completed.Sum(o => o.ChangeAmount);   // change is always given from the cash drawer
+
+            var cashSales = payments.Where(p => p.PaymentMethod == "Cash").Sum(p => p.Amount) - change;
+            var cardSales = payments.Where(p => p.PaymentMethod == "Card" || p.PaymentMethod == "BankTransfer").Sum(p => p.Amount);
+            var walletSales = payments.Where(p => p.PaymentMethod == "MobileWallet").Sum(p => p.Amount);
+
+            var breakdown = payments
+                .GroupBy(p => p.PaymentMethod)
+                .Select(g => new PaymentLine
+                {
+                    Method = g.Key,
+                    Amount = g.Sum(p => p.Amount) - (g.Key == "Cash" ? change : 0)
+                })
+                .ToList();
+
+            // Expenses: during the open..close time of the day (or the calendar date if there is no day record)
+            var expenseQuery = db.Expenses.AsNoTracking().Where(e => e.BranchId == branchId);
+            if (session != null)
+            {
+                var from = session.OpenedAt;
+                var to = session.ClosedAt ?? DateTime.UtcNow;
+                expenseQuery = expenseQuery.Where(e => e.ExpenseDate >= from && e.ExpenseDate <= to);
+            }
+            else
+            {
+                var next = date.AddDays(1);
+                expenseQuery = expenseQuery.Where(e => e.ExpenseDate >= date && e.ExpenseDate < next);
+            }
+            var expenses = (await expenseQuery.SumAsync(e => (decimal?)e.Amount)) ?? 0;
+
+            var totalSales = completed.Sum(o => o.TotalAmount);
+            var opening = session?.OpeningBalance ?? 0;
+
+            return new DaySummary
+            {
+                Date = date,
+                TotalSales = totalSales,
+                TotalOrders = completed.Count,
+                CompletedOrders = completed.Count,
+                VoidedOrders = voided,
+                OpenOrders = openOrders,
+                TotalItemsSold = (int)completed.SelectMany(o => o.Items).Sum(i => i.Quantity),
+                AvgOrderValue = completed.Count > 0 ? totalSales / completed.Count : 0,
+                CashSales = cashSales,
+                CardSales = cardSales,
+                WalletSales = walletSales,
+                TotalExpenses = expenses,
+                NetCash = cashSales - expenses,
+                OpeningBalance = opening,
+                ExpectedCash = opening + cashSales - expenses,
+                PaymentBreakdown = breakdown
+            };
         }
     }
 }
@@ -282,7 +543,7 @@ namespace POS.Infrastructure.Services
         {
             return await _db.Products
                 .Include(p => p.Unit)
-                .Where(p => p.BranchId == branchId && p.IsActive && p.CurrentStock <= p.MinimumStock)
+                .Where(p => p.BranchId == branchId && p.IsActive && p.ProductTypeId == ProductTypeIds.Inventory && p.CurrentStock <= p.MinimumStock)
                 .OrderBy(p => p.CurrentStock)
                 .ToListAsync();
         }
@@ -327,17 +588,43 @@ namespace POS.Infrastructure.Services
         {
             try
             {
+                // The POS saves a sale locally first and sends it later. The bill number it printed is kept,
+                // and sending the same sale twice (retry after a slow connection) returns the same order.
+                var clientNumber = string.IsNullOrWhiteSpace(dto.ClientOrderNumber) ? null : dto.ClientOrderNumber.Trim();
+                if (clientNumber != null && clientNumber.Length > 40) clientNumber = null;
+                if (clientNumber != null)
+                {
+                    var already = await _db.Orders.FirstOrDefaultAsync(o => o.OrderNumber == clientNumber);
+                    if (already != null)
+                    {
+                        if (already.BranchId == branchId) return already;
+                        clientNumber = null;   // number belongs to another branch -> make a new one
+                    }
+                }
+
+                // Time of the sale on the POS (an offline sale keeps its real time) and the business day it belongs to
+                var orderedAt = dto.OrderedAt.HasValue ? dto.OrderedAt.Value.ToUniversalTime() : DateTime.UtcNow;
+                if (orderedAt > DateTime.UtcNow.AddMinutes(5) || orderedAt < DateTime.UtcNow.AddDays(-14))
+                    orderedAt = DateTime.UtcNow;
+                var businessDay = await POS.Infrastructure.Data.BusinessDayHelper.ResolveForAsync(_db, branchId, orderedAt);
+
                 var order = new Order
                 {
                     BranchId = branchId,
+                    OrderedAt = orderedAt,
+                    BusinessDayId = businessDay?.Id,
+                    BusinessDate = businessDay != null
+                        ? businessDay.BusinessDate.Date
+                        : POS.Infrastructure.Data.BusinessTime.ToLocal(orderedAt).Date,
                     CustomerId = dto.CustomerId,
                     UserId = userId,
                     TableId = dto.TableId,
                     OrderType = dto.OrderType,
-                    OrderNumber = $"ORD-{DateTime.Now:yyyyMMddHHmmss}-{new Random().Next(100, 999)}",
+                    OrderNumber = clientNumber ?? $"ORD-{DateTime.Now:yyyyMMddHHmmss}-{new Random().Next(100, 999)}",
                     DiscountType = dto.DiscountType,
                     DiscountValue = dto.DiscountValue,
                     Notes = dto.Notes,
+                    KOTSentAt = dto.KOTSentAt,
                     Status = "Pending"
                 };
 
@@ -372,7 +659,9 @@ namespace POS.Infrastructure.Services
                         TaxAmount = tax,
                         DiscountAmount = itemDto.DiscountAmount,
                         TotalAmount = lineTotal,
-                        Notes = itemDto.Notes
+                        Notes = itemDto.Notes,
+                        IsKOTSent = itemDto.IsKOTSent,
+                        KOTSentAt = itemDto.IsKOTSent ? (itemDto.KOTSentAt ?? DateTime.UtcNow) : null
                     });
 
                     subTotal += lineBase;
@@ -434,24 +723,44 @@ namespace POS.Infrastructure.Services
                 order.Status = "Completed";
                 order.CompletedAt = DateTime.UtcNow;
 
+                // Stock out: Inventory item -> its own stock. Recipe item -> its ingredients.
+                // Deal item -> every inventory item in it, and the ingredients of recipe items inside it.
+                var graph = await POS.Infrastructure.Data.StockExpander.LoadAsync(_db, order.BranchId);
+                var consumption = new Dictionary<int, decimal>();
                 foreach (var item in order.Items)
+                    POS.Infrastructure.Data.StockExpander.Expand(item.ProductId, item.Quantity, graph, consumption);
+
+                var directPrice = new Dictionary<int, decimal>();
+                foreach (var item in order.Items)
+                    if (consumption.ContainsKey(item.ProductId) && !directPrice.ContainsKey(item.ProductId))
+                        directPrice[item.ProductId] = item.UnitPrice;
+
+                // (one lookup per product instead of list.Contains -> works on every SQL Server version)
+                var stockProducts = new Dictionary<int, Product>();
+                foreach (var stockId in consumption.Keys)
                 {
-                    if (item.Product == null) continue;
-                    var before = item.Product.CurrentStock;
-                    item.Product.CurrentStock -= item.Quantity;
+                    var stockProduct = await _db.Products.FindAsync(stockId);
+                    if (stockProduct != null) stockProducts[stockId] = stockProduct;
+                }
+
+                foreach (var used in consumption)
+                {
+                    if (!stockProducts.TryGetValue(used.Key, out var sp)) continue;
+                    var before = sp.CurrentStock;
+                    sp.CurrentStock -= used.Value;
 
                     _db.StockTransactions.Add(new StockTransaction
                     {
                         BranchId = order.BranchId,
-                        ProductId = item.ProductId,
+                        ProductId = used.Key,
                         UserId = order.UserId,
                         TransactionType = "StockOut",
                         ReferenceType = "Sale",
                         ReferenceId = (int)order.Id,
-                        Quantity = item.Quantity,
+                        Quantity = used.Value,
                         QuantityBefore = before,
-                        QuantityAfter = item.Product.CurrentStock,
-                        UnitCost = item.UnitPrice
+                        QuantityAfter = sp.CurrentStock,
+                        UnitCost = directPrice.TryGetValue(used.Key, out var up) ? up : sp.PurchasePrice
                     });
                 }
 
@@ -486,10 +795,72 @@ namespace POS.Infrastructure.Services
 
         public async Task<Order> VoidOrderAsync(long orderId, string reason)
         {
-            var order = await _db.Orders.FindAsync(orderId)
+            var order = await _db.Orders
+                .Include(o => o.Items)
+                .Include(o => o.Customer)
+                .FirstOrDefaultAsync(o => o.Id == orderId)
                 ?? throw new Exception("Order not found");
+
+            if (order.Status == "Voided")
+                throw new Exception("This order is already voided");
+
+            // Orders of a closed business day cannot be changed (the day was already counted)
+            if (order.BusinessDayId.HasValue)
+            {
+                var day = await _db.CashRegisterSessions.FirstOrDefaultAsync(s => s.Id == order.BusinessDayId.Value);
+                if (day != null && day.Status == "Closed")
+                    throw new Exception("The business day of this order is already closed. Reopen the day to void it.");
+            }
+
+            if (order.Status == "Completed")
+            {
+                // Put the stock back (recipe / deal -> their ingredients), same maths as the sale
+                var graph = await POS.Infrastructure.Data.StockExpander.LoadAsync(_db, order.BranchId);
+                var consumption = new Dictionary<int, decimal>();
+                foreach (var item in order.Items)
+                    POS.Infrastructure.Data.StockExpander.Expand(item.ProductId, item.Quantity, graph, consumption);
+
+                foreach (var used in consumption)
+                {
+                    var sp = await _db.Products.FindAsync(used.Key);
+                    if (sp == null) continue;
+                    var before = sp.CurrentStock;
+                    sp.CurrentStock += used.Value;
+
+                    _db.StockTransactions.Add(new StockTransaction
+                    {
+                        BranchId = order.BranchId,
+                        ProductId = used.Key,
+                        UserId = order.UserId,
+                        TransactionType = used.Value >= 0 ? "StockIn" : "StockOut",
+                        ReferenceType = "SaleVoid",
+                        ReferenceId = (int)order.Id,
+                        Quantity = Math.Abs(used.Value),
+                        QuantityBefore = before,
+                        QuantityAfter = sp.CurrentStock,
+                        UnitCost = sp.PurchasePrice
+                    });
+                }
+
+                // Credit sale: take the due amount back from the customer balance
+                if (order.CustomerId.HasValue && order.DueAmount > 0 && order.Customer != null)
+                {
+                    order.Customer.CurrentBalance -= order.DueAmount;
+                    _db.CustomerLedgers.Add(new CustomerLedger
+                    {
+                        CustomerId = order.CustomerId.Value,
+                        TransactionType = "SaleVoid",
+                        ReferenceId = (int)order.Id,
+                        Debit = order.PaidAmount,
+                        Credit = order.TotalAmount,
+                        Balance = order.Customer.CurrentBalance
+                    });
+                }
+            }
+
+            var voidNote = $"Voided: {(string.IsNullOrWhiteSpace(reason) ? "no reason" : reason.Trim())}";
+            order.Notes = string.IsNullOrWhiteSpace(order.Notes) ? voidNote : $"{order.Notes} | {voidNote}";
             order.Status = "Voided";
-            order.Notes = $"Voided: {reason}";
             await _db.SaveChangesAsync();
             return order;
         }
@@ -612,13 +983,15 @@ namespace POS.Infrastructure.Services
 
         public async Task<DashboardDto> GetDashboardDataAsync(int branchId)
         {
-            var today = DateTime.Today;
+            var openDay = await POS.Infrastructure.Data.BusinessDayHelper.GetOpenAsync(_db, branchId);
+            var today = openDay != null ? openDay.BusinessDate.Date : POS.Infrastructure.Data.BusinessTime.LocalToday();
+            var expenseFrom = openDay != null ? openDay.OpenedAt : today;
             var monthStart = new DateTime(today.Year, today.Month, 1);
 
             var todayOrders = await _db.Orders
                 .Where(o => o.BranchId == branchId &&
                             o.Status == "Completed" &&
-                            o.CompletedAt >= today)
+                            o.BusinessDate == today)
                 .ToListAsync();
 
             var todaySales = todayOrders.Sum(o => o.TotalAmount);
@@ -628,7 +1001,7 @@ namespace POS.Infrastructure.Services
                     o.Id == oi.OrderId &&
                     o.BranchId == branchId &&
                     o.Status == "Completed" &&
-                    o.CompletedAt >= today))
+                    o.BusinessDate == today))
                 .Join(_db.Products,
                     oi => oi.ProductId,
                     p => p.Id,
@@ -636,18 +1009,19 @@ namespace POS.Infrastructure.Services
                 .SumAsync();
 
             var todayExpenses = await _db.Expenses
-                .Where(e => e.BranchId == branchId && e.ExpenseDate >= today)
+                .Where(e => e.BranchId == branchId && e.ExpenseDate >= expenseFrom)
                 .SumAsync(e => e.Amount);
 
             var monthSales = await _db.Orders
                 .Where(o => o.BranchId == branchId &&
                             o.Status == "Completed" &&
-                            o.CompletedAt >= monthStart)
+                            o.BusinessDate >= monthStart)
                 .SumAsync(o => (decimal?)o.TotalAmount) ?? 0;
 
             var lowStockCount = await _db.Products
                 .Where(p => p.BranchId == branchId &&
                             p.IsActive &&
+                            p.ProductTypeId == ProductTypeIds.Inventory &&
                             p.CurrentStock <= p.MinimumStock)
                 .CountAsync();
 
@@ -661,8 +1035,8 @@ namespace POS.Infrastructure.Services
                 var sales = await _db.Orders
                     .Where(o => o.BranchId == branchId &&
                                 o.Status == "Completed" &&
-                                o.CompletedAt >= ms &&
-                                o.CompletedAt < me)
+                                o.BusinessDate >= ms &&
+                                o.BusinessDate < me)
                     .SumAsync(o => (decimal?)o.TotalAmount) ?? 0;
                 monthlyData.Add(new MonthlySalesDto(m.ToString("MMM"), sales, sales * 0.3m));
             }
@@ -672,7 +1046,7 @@ namespace POS.Infrastructure.Services
                     o.Id == oi.OrderId &&
                     o.BranchId == branchId &&
                     o.Status == "Completed" &&
-                    o.CompletedAt >= monthStart))
+                    o.BusinessDate >= monthStart))
                 .GroupBy(oi => oi.ProductId)
                 .Select(g => new
                 {
@@ -691,6 +1065,7 @@ namespace POS.Infrastructure.Services
             var lowStockProducts = await _db.Products
                 .Where(p => p.BranchId == branchId &&
                             p.IsActive &&
+                            p.ProductTypeId == ProductTypeIds.Inventory &&
                             p.CurrentStock <= p.MinimumStock)
                 .Include(p => p.Unit)
                 .Take(10)
@@ -732,12 +1107,12 @@ namespace POS.Infrastructure.Services
                 .Include(o => o.Agent)
                 .Where(o => o.BranchId == branchId &&
                             o.Status == "Completed" &&
-                            o.CompletedAt >= startDate &&
-                            o.CompletedAt < endInclusive)
+                            o.BusinessDate >= startDate.Date &&
+                            o.BusinessDate < endInclusive.Date)
                 .ToListAsync();
 
             var byDate = orders
-                .GroupBy(o => o.CompletedAt!.Value.Date)
+                .GroupBy(o => o.BusinessDate.Date)
                 .Select(g =>
                 {
                     var cost = g.SelectMany(o => o.Items)
@@ -806,7 +1181,7 @@ namespace POS.Infrastructure.Services
             var products = await _db.Products
                 .Include(p => p.Category)
                 .Include(p => p.Unit)
-                .Where(p => p.BranchId == branchId && p.IsActive)
+                .Where(p => p.BranchId == branchId && p.IsActive && p.ProductTypeId == ProductTypeIds.Inventory)
                 .ToListAsync();
 
             return new
@@ -885,8 +1260,8 @@ namespace POS.Infrastructure.Services
                 .Include(o => o.Items).ThenInclude(i => i.Product)
                 .Where(o => o.BranchId == branchId &&
                             o.Status == "Completed" &&
-                            o.CompletedAt >= startDate &&
-                            o.CompletedAt < endInclusive)
+                            o.BusinessDate >= startDate.Date &&
+                            o.BusinessDate < endInclusive.Date)
                 .ToListAsync();
 
             var totalRevenue = orders.Sum(o => o.TotalAmount);
@@ -914,52 +1289,40 @@ namespace POS.Infrastructure.Services
             };
         }
 
-        public async Task<object> GetDailyClosingAsync(int branchId, DateTime date)
+        public async Task<object> GetDailyClosingAsync(int branchId, DateTime? date)
         {
-            var nextDay = date.AddDays(1);
-            var orders = await _db.Orders
-                .Include(o => o.Payments)
-                .Include(o => o.Items)
-                .Where(o => o.BranchId == branchId &&
-                            o.CompletedAt >= date &&
-                            o.CompletedAt < nextDay)
-                .ToListAsync();
+            var businessDate = date.HasValue
+                ? date.Value.Date
+                : await POS.Infrastructure.Data.BusinessDayHelper.CurrentDateAsync(_db, branchId);
 
-            var completed = orders.Where(o => o.Status == "Completed").ToList();
-            var voided = orders.Where(o => o.Status == "Voided").ToList();
+            var session = await _db.CashRegisterSessions.AsNoTracking()
+                .Where(s => s.BranchId == branchId && s.BusinessDate == businessDate)
+                .OrderByDescending(s => s.OpenedAt)
+                .FirstOrDefaultAsync();
 
-            var allPayments = completed.SelectMany(o => o.Payments).ToList();
-            var paymentBreakdown = allPayments
-                .GroupBy(p => p.PaymentMethod)
-                .Select(g => new { Method = g.Key, Amount = g.Sum(p => p.Amount) })
-                .ToList();
-
-            var expenses = await _db.Expenses
-                .Where(e => e.BranchId == branchId &&
-                            e.ExpenseDate >= date &&
-                            e.ExpenseDate < nextDay)
-                .SumAsync(e => e.Amount);
-
-            var totalSales = completed.Sum(o => o.TotalAmount);
-            var cashSales = allPayments.Where(p => p.PaymentMethod == "Cash").Sum(p => p.Amount);
-            var cardSales = allPayments.Where(p => p.PaymentMethod is "Card" or "BankTransfer").Sum(p => p.Amount);
-            var walletSales = allPayments.Where(p => p.PaymentMethod == "MobileWallet").Sum(p => p.Amount);
-
+            var summary = await POS.Infrastructure.Data.BusinessDayHelper.BuildSummaryAsync(_db, branchId, businessDate, session);
             return new
             {
-                Date = date,
-                TotalSales = totalSales,
-                TotalOrders = completed.Count,
-                CompletedOrders = completed.Count,
-                VoidedOrders = voided.Count,
-                TotalItemsSold = (int)completed.SelectMany(o => o.Items).Sum(i => i.Quantity),
-                AvgOrderValue = completed.Any() ? totalSales / completed.Count : 0,
-                CashSales = cashSales,
-                CardSales = cardSales,
-                WalletSales = walletSales,
-                TotalExpenses = expenses,
-                NetCash = cashSales - expenses,
-                PaymentBreakdown = paymentBreakdown
+                summary.Date,
+                summary.TotalSales,
+                summary.TotalOrders,
+                summary.CompletedOrders,
+                summary.VoidedOrders,
+                summary.OpenOrders,
+                summary.TotalItemsSold,
+                summary.AvgOrderValue,
+                summary.CashSales,
+                summary.CardSales,
+                summary.WalletSales,
+                summary.TotalExpenses,
+                summary.NetCash,
+                summary.OpeningBalance,
+                summary.ExpectedCash,
+                summary.PaymentBreakdown,
+                Status = session?.Status,
+                OpenedAt = session?.OpenedAt,
+                ClosedAt = session?.ClosedAt,
+                ClosingBalance = session?.ClosingBalance
             };
         }
     }

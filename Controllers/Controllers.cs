@@ -120,9 +120,10 @@ namespace POS.API.Controllers
             [FromQuery] int pageSize = 50,
             [FromQuery] string? search = null,
             [FromQuery] int? categoryId = null,
-            [FromQuery] bool? lowStock = null)
+            [FromQuery] bool? lowStock = null,
+            [FromQuery] int? productTypeId = null)
         {
-            var query = _db.Products
+            var query = _db.Products.AsNoTracking()
                 .Include(p => p.Category)
                 .Include(p => p.Unit)
                 .Where(p => p.BranchId == CurrentBranchId && p.IsActive);
@@ -136,8 +137,11 @@ namespace POS.API.Controllers
             if (categoryId.HasValue)
                 query = query.Where(p => p.CategoryId == categoryId.Value);
 
+            if (productTypeId.HasValue)
+                query = query.Where(p => p.ProductTypeId == productTypeId.Value);
+
             if (lowStock == true)
-                query = query.Where(p => p.CurrentStock <= p.MinimumStock);
+                query = query.Where(p => p.ProductTypeId == ProductTypeIds.Inventory && p.CurrentStock <= p.MinimumStock);
 
             var total = await query.CountAsync();
             var items = await query
@@ -146,19 +150,24 @@ namespace POS.API.Controllers
                 .Take(pageSize)
                 .ToListAsync();
 
+            await ApplyAvailableStockAsync(items);   // Recipe / Deal: stock = portions possible from ingredients
+
             return Ok(ApiResponse<IEnumerable<Product>>.Ok(items, totalCount: total));
         }
 
         [HttpGet("{id}")]
         public async Task<IActionResult> GetById(int id)
         {
-            var product = await _db.Products
+            var product = await _db.Products.AsNoTracking()
                 .Include(p => p.Category)
                 .Include(p => p.Unit)
+                .Include(p => p.Components).ThenInclude(c => c.ComponentProduct).ThenInclude(cp => cp!.Unit)
                 .FirstOrDefaultAsync(p => p.Id == id && p.BranchId == CurrentBranchId);
 
             if (product == null)
                 return NotFound(ApiResponse<Product>.Fail("Product not found"));
+
+            await ApplyAvailableStockAsync(new List<Product> { product });
 
             return Ok(ApiResponse<Product>.Ok(product));
         }
@@ -169,6 +178,8 @@ namespace POS.API.Controllers
             var product = await _productService.GetByBarcodeAsync(barcode);
             if (product == null)
                 return NotFound(ApiResponse<Product>.Fail("Product not found"));
+
+            await ApplyAvailableStockAsync(new List<Product> { product });
 
             return Ok(ApiResponse<Product>.Ok(product));
         }
@@ -184,9 +195,14 @@ namespace POS.API.Controllers
         [HttpPost]
         public async Task<IActionResult> Create([FromBody] CreateProductDto dto)
         {
+            var (error, components) = await BuildComponentsAsync(null, dto);
+            if (error != null) return BadRequest(ApiResponse<Product>.Fail(error));
+
             var product = new Product
             {
                 BranchId = CurrentBranchId,
+                ProductTypeId = dto.ProductTypeId,
+                Components = components,
                 CategoryId = dto.CategoryId,
                 UnitId = dto.UnitId,
                 Name = dto.Name,
@@ -216,6 +232,43 @@ namespace POS.API.Controllers
             if (product == null || product.BranchId != CurrentBranchId)
                 return NotFound(ApiResponse<Product>.Fail("Product not found"));
 
+            var (error, components) = await BuildComponentsAsync(id, dto);
+            if (error != null) return BadRequest(ApiResponse<Product>.Fail(error));
+
+            // A product that is already used inside other recipes/deals must keep a type that is allowed there
+            if (dto.ProductTypeId != product.ProductTypeId)
+            {
+                // (join instead of list.Contains -> works on every SQL Server version)
+                var parentTypes = await _db.ProductComponents
+                    .Where(x => x.ComponentProductId == id)
+                    .Join(_db.Products, x => x.ParentProductId, p => p.Id, (x, p) => p.ProductTypeId)
+                    .ToListAsync();
+                if (parentTypes.Count > 0)
+                {
+                    var allowed = dto.ProductTypeId == ProductTypeIds.Inventory
+                        || (dto.ProductTypeId == ProductTypeIds.Recipe && !parentTypes.Contains(ProductTypeIds.Recipe));
+                    if (!allowed)
+                        return BadRequest(ApiResponse<Product>.Fail(
+                            "This product is used inside other recipes/deals, so its type cannot be changed"));
+                }
+            }
+
+            // Sync recipe / deal items: update quantities, remove deleted rows, add new rows
+            var oldItems = await _db.ProductComponents.Where(x => x.ParentProductId == id).ToListAsync();
+            foreach (var removed in oldItems.Where(o => !components.Any(n => n.ComponentProductId == o.ComponentProductId)))
+                _db.ProductComponents.Remove(removed);
+            foreach (var item in components)
+            {
+                var existing = oldItems.FirstOrDefault(o => o.ComponentProductId == item.ComponentProductId);
+                if (existing != null) existing.Quantity = item.Quantity;
+                else
+                {
+                    item.ParentProductId = id;
+                    _db.ProductComponents.Add(item);
+                }
+            }
+
+            product.ProductTypeId = dto.ProductTypeId;
             product.CategoryId = dto.CategoryId;
             product.UnitId = dto.UnitId;
             product.Name = dto.Name;
@@ -241,6 +294,13 @@ namespace POS.API.Controllers
             if (product == null || product.BranchId != CurrentBranchId)
                 return NotFound(ApiResponse<Product>.Fail("Product not found"));
 
+            var usedInActive = await _db.ProductComponents.AnyAsync(x =>
+                x.ComponentProductId == id &&
+                _db.Products.Any(p => p.Id == x.ParentProductId && p.IsActive));
+            if (usedInActive)
+                return BadRequest(ApiResponse<Product>.Fail(
+                    "This product is used in a recipe or deal. Remove it from there first."));
+
             product.IsActive = false;
             product.UpdatedAt = DateTime.UtcNow;
             await _db.SaveChangesAsync();
@@ -251,9 +311,91 @@ namespace POS.API.Controllers
         [HttpPost("{id}/stock-adjustment")]
         public async Task<IActionResult> AdjustStock(int id, [FromBody] StockAdjustmentDto dto)
         {
+            var product = await _db.Products.AsNoTracking().FirstOrDefaultAsync(p => p.Id == id && p.BranchId == CurrentBranchId);
+            if (product != null && product.ProductTypeId != ProductTypeIds.Inventory)
+                return BadRequest(ApiResponse<object>.Fail("Stock can only be adjusted for inventory products"));
+
             var success = await _productService.UpdateStockAsync(id, dto.Quantity, dto.Type, CurrentUserId);
             if (!success) return NotFound(ApiResponse<object>.Fail("Product not found"));
             return Ok(ApiResponse<object>.Ok(null!, "Stock updated"));
+        }
+
+        // Recipe / Deal products have no stock of their own: show how many can be made from ingredient stock
+        private async Task ApplyAvailableStockAsync(List<Product> items)
+        {
+            if (!items.Any(p => p.ProductTypeId != ProductTypeIds.Inventory)) return;
+            var graph = await StockExpander.LoadAsync(_db, CurrentBranchId);
+            foreach (var p in items.Where(p => p.ProductTypeId != ProductTypeIds.Inventory))
+                p.CurrentStock = StockExpander.Available(p.Id, graph);
+        }
+
+        // Validates the type + items of a product and builds the recipe / deal rows
+        private async Task<(string? Error, List<ProductComponent> Items)> BuildComponentsAsync(int? productId, CreateProductDto dto)
+        {
+            var items = new List<ProductComponent>();
+
+            if (!await _db.ProductTypes.AnyAsync(t => t.Id == dto.ProductTypeId))
+                return ("Invalid product type", items);
+
+            if (dto.ProductTypeId == ProductTypeIds.Inventory)
+                return (null, items);   // inventory products have no recipe / deal items
+
+            var isRecipe = dto.ProductTypeId == ProductTypeIds.Recipe;
+            var rows = dto.Components ?? new List<ProductComponentDto>();
+
+            if (rows.Count == 0)
+                return (isRecipe ? "Add at least one ingredient to the recipe" : "Add at least one item to the deal", items);
+            if (rows.Any(r => r.Quantity <= 0))
+                return ("Quantity must be greater than zero", items);
+            if (rows.GroupBy(r => r.ComponentProductId).Any(g => g.Count() > 1))
+                return ("The same item is added more than once", items);
+            if (productId.HasValue && rows.Any(r => r.ComponentProductId == productId.Value))
+                return ("A product cannot contain itself", items);
+
+            var ids = rows.Select(r => r.ComponentProductId).ToList();
+            // (filtered in memory instead of list.Contains -> works on every SQL Server version)
+            var branchProducts = await _db.Products.AsNoTracking()
+                .Where(p => p.BranchId == CurrentBranchId && p.IsActive)
+                .Select(p => new { p.Id, p.ProductTypeId })
+                .ToListAsync();
+            var found = branchProducts.Where(p => ids.Contains(p.Id)).ToList();
+
+            if (found.Count != ids.Count)
+                return ("One or more selected items were not found", items);
+
+            var allowed = isRecipe
+                ? new[] { ProductTypeIds.Inventory }
+                : new[] { ProductTypeIds.Inventory, ProductTypeIds.Recipe };
+            if (found.Any(f => !allowed.Contains(f.ProductTypeId)))
+                return (isRecipe
+                    ? "A recipe can only contain inventory products"
+                    : "A deal can only contain inventory or recipe products", items);
+
+            items = rows.Select(r => new ProductComponent
+            {
+                ComponentProductId = r.ComponentProductId,
+                Quantity = r.Quantity
+            }).ToList();
+            return (null, items);
+        }
+    }
+
+    // ============================================
+    // PRODUCT TYPES CONTROLLER (read only — fixed list)
+    // ============================================
+    [Authorize]
+    [Route("api/product-types")]
+    [ApiController]
+    public class ProductTypesController : BaseController
+    {
+        private readonly PosDbContext _db;
+        public ProductTypesController(PosDbContext db) => _db = db;
+
+        [HttpGet]
+        public async Task<IActionResult> GetAll()
+        {
+            var types = await _db.ProductTypes.AsNoTracking().OrderBy(t => t.Id).ToListAsync();
+            return Ok(ApiResponse<IEnumerable<ProductType>>.Ok(types));
         }
     }
 
@@ -363,23 +505,29 @@ namespace POS.API.Controllers
             [FromQuery] DateTime? startDate,
             [FromQuery] DateTime? endDate,
             [FromQuery] string? status = null,
+            [FromQuery] string? search = null,
             [FromQuery] int page = 1,
             [FromQuery] int pageSize = 20)
         {
-            var query = _db.Orders
+            var query = _db.Orders.AsNoTracking()
                 .Include(o => o.Customer)
                 .Include(o => o.User)
                 .Include(o => o.Table)
                 .Include(o => o.Agent)
+                .Include(o => o.Payments)
                 .Where(o => o.BranchId == CurrentBranchId);
 
-            if (startDate.HasValue) query = query.Where(o => o.CreatedAt >= startDate.Value);
-            if (endDate.HasValue) query = query.Where(o => o.CreatedAt <= endDate.Value.AddDays(1));
+            // Dates are business dates (the day the sale belongs to), both ends included
+            if (startDate.HasValue) query = query.Where(o => o.BusinessDate >= startDate.Value.Date);
+            if (endDate.HasValue) query = query.Where(o => o.BusinessDate <= endDate.Value.Date);
             if (!string.IsNullOrEmpty(status)) query = query.Where(o => o.Status == status);
+            if (!string.IsNullOrEmpty(search))
+                query = query.Where(o => o.OrderNumber.Contains(search) ||
+                                         (o.Customer != null && o.Customer.Name.Contains(search)));
 
             var total = await query.CountAsync();
             var orders = await query
-                .OrderByDescending(o => o.CreatedAt)
+                .OrderByDescending(o => o.OrderedAt)
                 .Skip((page - 1) * pageSize)
                 .Take(pageSize)
                 .ToListAsync();
@@ -434,10 +582,17 @@ namespace POS.API.Controllers
 
         [Authorize(Roles = "Admin,Manager")]
         [HttpPost("{id}/void")]
-        public async Task<IActionResult> Void(long id, [FromBody] string reason)
+        public async Task<IActionResult> Void(long id, [FromBody] string? reason)
         {
-            var order = await _orderService.VoidOrderAsync(id, reason);
-            return Ok(ApiResponse<Order>.Ok(order, "Order voided"));
+            try
+            {
+                var order = await _orderService.VoidOrderAsync(id, reason ?? string.Empty);
+                return Ok(ApiResponse<Order>.Ok(order, "Order voided"));
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ApiResponse<object>.Fail(ex.Message));
+            }
         }
 
         [HttpPost("{id}/kot")]
@@ -995,9 +1150,173 @@ namespace POS.API.Controllers
         [HttpGet("daily-closing")]
         public async Task<IActionResult> DailyClosing([FromQuery] DateTime? date)
         {
-            var report = await _reportService.GetDailyClosingAsync(
-                CurrentBranchId, date ?? DateTime.Today);
+            var report = await _reportService.GetDailyClosingAsync(CurrentBranchId, date);
             return Ok(ApiResponse<object>.Ok(report));
+        }
+    }
+
+    // ============================================
+    // BUSINESS DAYS CONTROLLER (Day Open / Day Close)
+    // ============================================
+    [Authorize]
+    [Route("api/business-days")]
+    [ApiController]
+    public class BusinessDaysController : BaseController
+    {
+        private readonly PosDbContext _db;
+        public BusinessDaysController(PosDbContext db) => _db = db;
+
+        // GET api/business-days/current?withSummary=true  -> is a day open right now?
+        [HttpGet("current")]
+        public async Task<IActionResult> Current([FromQuery] bool withSummary = false)
+        {
+            var open = await BusinessDayHelper.GetOpenAsync(_db, CurrentBranchId);
+            DaySummary? summary = null;
+            if (withSummary && open != null)
+                summary = await BusinessDayHelper.BuildSummaryAsync(_db, CurrentBranchId, open.BusinessDate.Date, open);
+
+            return Ok(ApiResponse<object>.Ok(new
+            {
+                isOpen = open != null,
+                day = open,
+                summary,
+                suggestedDate = BusinessTime.LocalToday()
+            }));
+        }
+
+        // GET api/business-days  -> history (newest first)
+        [HttpGet]
+        public async Task<IActionResult> GetAll([FromQuery] int page = 1, [FromQuery] int pageSize = 30)
+        {
+            var query = _db.CashRegisterSessions.AsNoTracking().Where(s => s.BranchId == CurrentBranchId);
+            var total = await query.CountAsync();
+            var days = await query
+                .OrderByDescending(s => s.OpenedAt)
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .ToListAsync();
+
+            var userRows = await _db.Users.AsNoTracking()
+                .Where(u => u.BranchId == CurrentBranchId)
+                .Select(u => new { u.Id, u.FullName })
+                .ToListAsync();
+            var names = userRows.ToDictionary(u => u.Id, u => u.FullName);
+
+            var items = days.Select(s => new
+            {
+                s.Id, s.BusinessDate, s.Status, s.OpenedAt, s.ClosedAt,
+                s.OpeningBalance, s.ClosingBalance, s.ExpectedCash,
+                difference = s.ClosingBalance.HasValue && s.ExpectedCash.HasValue ? s.ClosingBalance.Value - s.ExpectedCash.Value : (decimal?)null,
+                s.CashSales, s.CardSales, s.WalletSales, s.TotalExpenses,
+                s.Notes, s.CloseNotes,
+                openedBy = names.TryGetValue(s.UserId, out var o) ? o : null,
+                closedBy = s.ClosedByUserId.HasValue && names.TryGetValue(s.ClosedByUserId.Value, out var cb) ? cb : null
+            }).ToList();
+
+            return Ok(ApiResponse<object>.Ok(items, totalCount: total));
+        }
+
+        // GET api/business-days/5/summary
+        [HttpGet("{id}/summary")]
+        public async Task<IActionResult> Summary(int id)
+        {
+            var day = await _db.CashRegisterSessions.AsNoTracking()
+                .FirstOrDefaultAsync(s => s.Id == id && s.BranchId == CurrentBranchId);
+            if (day == null) return NotFound(ApiResponse<object>.Fail("Business day not found"));
+
+            var summary = await BusinessDayHelper.BuildSummaryAsync(_db, CurrentBranchId, day.BusinessDate.Date, day);
+            return Ok(ApiResponse<object>.Ok(new { day, summary }));
+        }
+
+        // POST api/business-days/open
+        [HttpPost("open")]
+        public async Task<IActionResult> Open([FromBody] OpenDayDto dto)
+        {
+            if (dto.OpeningBalance < 0)
+                return BadRequest(ApiResponse<object>.Fail("Opening cash cannot be negative"));
+
+            var alreadyOpen = await BusinessDayHelper.GetOpenAsync(_db, CurrentBranchId);
+            if (alreadyOpen != null)
+                return BadRequest(ApiResponse<object>.Fail(
+                    $"The day of {alreadyOpen.BusinessDate:dd MMM yyyy} is still open. Close it first."));
+
+            var date = (dto.BusinessDate ?? BusinessTime.LocalToday()).Date;
+            if (date > BusinessTime.LocalToday().AddDays(1))
+                return BadRequest(ApiResponse<object>.Fail("Business date cannot be in the future"));
+
+            var exists = await _db.CashRegisterSessions.AnyAsync(s => s.BranchId == CurrentBranchId && s.BusinessDate == date);
+            if (exists)
+                return BadRequest(ApiResponse<object>.Fail(
+                    $"A day for {date:dd MMM yyyy} already exists. Reopen it from the history instead."));
+
+            var session = new CashRegisterSession
+            {
+                BranchId = CurrentBranchId,
+                UserId = CurrentUserId,
+                OpeningBalance = dto.OpeningBalance,
+                Status = "Open",
+                OpenedAt = DateTime.UtcNow,
+                BusinessDate = date,
+                Notes = dto.Notes
+            };
+            _db.CashRegisterSessions.Add(session);
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<CashRegisterSession>.Ok(session, "Day opened"));
+        }
+
+        // POST api/business-days/5/close
+        [HttpPost("{id}/close")]
+        public async Task<IActionResult> Close(int id, [FromBody] CloseDayDto dto)
+        {
+            var day = await _db.CashRegisterSessions.FirstOrDefaultAsync(s => s.Id == id && s.BranchId == CurrentBranchId);
+            if (day == null) return NotFound(ApiResponse<object>.Fail("Business day not found"));
+            if (day.Status != "Open") return BadRequest(ApiResponse<object>.Fail("This day is already closed"));
+            if (dto.ClosingBalance < 0) return BadRequest(ApiResponse<object>.Fail("Closing cash cannot be negative"));
+
+            var summary = await BusinessDayHelper.BuildSummaryAsync(_db, CurrentBranchId, day.BusinessDate.Date, day);
+
+            day.Status = "Closed";
+            day.ClosedAt = DateTime.UtcNow;
+            day.ClosedByUserId = CurrentUserId;
+            day.ClosingBalance = dto.ClosingBalance;
+            day.ExpectedCash = summary.ExpectedCash;
+            day.CashSales = summary.CashSales;
+            day.CardSales = summary.CardSales;
+            day.WalletSales = summary.WalletSales;
+            day.TotalExpenses = summary.TotalExpenses;
+            day.CloseNotes = dto.Notes;
+            await _db.SaveChangesAsync();
+
+            return Ok(ApiResponse<object>.Ok(new
+            {
+                day,
+                summary,
+                difference = dto.ClosingBalance - summary.ExpectedCash
+            }, "Day closed"));
+        }
+
+        // POST api/business-days/5/reopen  (Admin / Manager)
+        [Authorize(Roles = "Admin,Manager")]
+        [HttpPost("{id}/reopen")]
+        public async Task<IActionResult> Reopen(int id)
+        {
+            var day = await _db.CashRegisterSessions.FirstOrDefaultAsync(s => s.Id == id && s.BranchId == CurrentBranchId);
+            if (day == null) return NotFound(ApiResponse<object>.Fail("Business day not found"));
+            if (day.Status != "Closed") return BadRequest(ApiResponse<object>.Fail("This day is not closed"));
+
+            var other = await BusinessDayHelper.GetOpenAsync(_db, CurrentBranchId);
+            if (other != null)
+                return BadRequest(ApiResponse<object>.Fail(
+                    $"The day of {other.BusinessDate:dd MMM yyyy} is open. Close it before reopening another day."));
+
+            day.Status = "Open";
+            day.ClosedAt = null;
+            day.ClosedByUserId = null;
+            day.ClosingBalance = null;
+            day.ExpectedCash = null;
+            day.CloseNotes = null;
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<CashRegisterSession>.Ok(day, "Day reopened"));
         }
     }
 

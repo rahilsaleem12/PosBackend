@@ -111,8 +111,35 @@ namespace POS.Core.Entities
         public decimal MinimumStock { get; set; } = 5;
         public decimal MaximumStock { get; set; } = 1000;
         public bool IsFeatured { get; set; } = false;
+        public int ProductTypeId { get; set; } = ProductTypeIds.Inventory;   // 1 Inventory, 2 Recipe, 3 Deal & Combo
         public Category? Category { get; set; }
         public Unit? Unit { get; set; }
+        public ICollection<ProductComponent> Components { get; set; } = new List<ProductComponent>();
+    }
+
+    // Product type ids (rows are seeded in the ProductTypes table)
+    public static class ProductTypeIds
+    {
+        public const int Inventory = 1;   // normal stock item (Bun, Chicken, Cold Drink...)
+        public const int Recipe = 2;      // made from inventory products (Zinger Burger)
+        public const int Deal = 3;        // bundle of inventory and/or recipe products
+    }
+
+    public class ProductType
+    {
+        public int Id { get; set; }
+        public string Name { get; set; } = string.Empty;
+    }
+
+    // Recipe ingredient (Recipe -> Inventory) or Deal item (Deal -> Inventory/Recipe).
+    // Quantity = amount needed for ONE unit of the parent product, in the component's own unit.
+    public class ProductComponent
+    {
+        public int Id { get; set; }
+        public int ParentProductId { get; set; }
+        public int ComponentProductId { get; set; }
+        public decimal Quantity { get; set; }
+        public Product? ComponentProduct { get; set; }
     }
 
     public class Supplier : BaseEntity
@@ -229,6 +256,29 @@ namespace POS.Core.Entities
         public decimal CommissionAmount { get; set; } = 0;   // fixed amount per completed order
     }
 
+    // Day open / day close. Mapped to the existing CashRegisterSessions table.
+    public class CashRegisterSession
+    {
+        public int Id { get; set; }
+        public int BranchId { get; set; }
+        public int UserId { get; set; }                       // user who opened the day
+        public decimal OpeningBalance { get; set; } = 0;      // cash in drawer at day open
+        public decimal? ClosingBalance { get; set; }          // cash counted at day close
+        public decimal? ExpectedCash { get; set; }            // opening + cash sales - expenses
+        public decimal CashSales { get; set; } = 0;
+        public decimal CardSales { get; set; } = 0;
+        public decimal WalletSales { get; set; } = 0;
+        public decimal TotalExpenses { get; set; } = 0;
+        public string Status { get; set; } = "Open";          // Open | Closed
+        public DateTime OpenedAt { get; set; } = DateTime.UtcNow;
+        public DateTime? ClosedAt { get; set; }
+        public string? Notes { get; set; }
+        // columns added by 03_DayClosing_Changes.sql
+        public DateTime BusinessDate { get; set; }            // the date all sales of this day are saved under
+        public int? ClosedByUserId { get; set; }
+        public string? CloseNotes { get; set; }
+    }
+
     public class Order
     {
         public long Id { get; set; }
@@ -238,6 +288,8 @@ namespace POS.Core.Entities
         public int? TableId { get; set; }
         public int? AgentId { get; set; }
         public decimal AgentCommission { get; set; } = 0;   // order ke waqt agent ka commission (snapshot)
+        public DateTime BusinessDate { get; set; }          // business day the sale belongs to (date only)
+        public int? BusinessDayId { get; set; }             // CashRegisterSessions.Id of that day
         public string OrderNumber { get; set; } = string.Empty;
         public string OrderType { get; set; } = "Takeaway";
         public string Status { get; set; } = "Pending";
@@ -400,6 +452,8 @@ namespace POS.Core.DTOs
         public decimal TaxRate { get; set; }
         public decimal MinimumStock { get; set; } = 5;
         public bool IsFeatured { get; set; }
+        public int ProductTypeId { get; set; } = POS.Core.Entities.ProductTypeIds.Inventory;
+        public List<ProductComponentDto> Components { get; set; } = new();
     }
 
     public class CreateOrderDto
@@ -407,6 +461,9 @@ namespace POS.Core.DTOs
         public int? CustomerId { get; set; }
         public int? TableId { get; set; }
         public int? AgentId { get; set; }
+        public DateTime? OrderedAt { get; set; }   // time of the sale on the POS (matters for offline sales)
+        public string? ClientOrderNumber { get; set; }   // bill number made by the POS (sale is saved on the POS first)
+        public DateTime? KOTSentAt { get; set; }   // KOT print time (set offline by the POS)
         public string OrderType { get; set; } = "Takeaway";
         public string? DiscountType { get; set; }
         public decimal DiscountValue { get; set; }
@@ -422,6 +479,8 @@ namespace POS.Core.DTOs
         public decimal UnitPrice { get; set; }
         public decimal DiscountAmount { get; set; }
         public string? Notes { get; set; }
+        public bool IsKOTSent { get; set; }          // item was already printed on a KOT
+        public DateTime? KOTSentAt { get; set; }
     }
 
     public class OrderPaymentDto
@@ -487,6 +546,9 @@ namespace POS.Core.DTOs
 
     public record ChangePasswordDto(string OldPassword, string NewPassword);
     public record CategoryDto(string Name, string? Icon, string? Color, int SortOrder);
+    public record OpenDayDto(DateTime? BusinessDate, decimal OpeningBalance, string? Notes);
+    public record CloseDayDto(decimal ClosingBalance, string? Notes);
+    public record ProductComponentDto(int ComponentProductId, decimal Quantity);
     public record SalesAgentDto(string Name, string? Phone, string AgentType, decimal CommissionAmount);
     public record CustomerDto(string Name, string? Phone, string? Email, string? Address, decimal CreditLimit);
     public record CustomerPaymentDto(decimal Amount, string? Notes);
@@ -561,7 +623,7 @@ namespace POS.Core.Interfaces
         Task<object> GetStockReportAsync(int branchId);
         Task<object> GetExpenseReportAsync(int branchId, DateTime startDate, DateTime endDate);
         Task<object> GetProfitLossAsync(int branchId, DateTime startDate, DateTime endDate);
-        Task<object> GetDailyClosingAsync(int branchId, DateTime date);
+        Task<object> GetDailyClosingAsync(int branchId, DateTime? date);
     }
 
     public interface ISyncService
