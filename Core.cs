@@ -112,9 +112,64 @@ namespace POS.Core.Entities
         public decimal MaximumStock { get; set; } = 1000;
         public bool IsFeatured { get; set; } = false;
         public int ProductTypeId { get; set; } = ProductTypeIds.Inventory;   // 1 Inventory, 2 Recipe, 3 Deal & Combo
+        public int? ProductClassId { get; set; }   // KOT is printed one slip per product class
         public Category? Category { get; set; }
         public Unit? Unit { get; set; }
         public ICollection<ProductComponent> Components { get; set; } = new List<ProductComponent>();
+    }
+
+    // Product class: groups products so the KOT prints one slip per class (e.g. Kitchen, Fryer, Drinks)
+    public class ProductClass : BaseEntity
+    {
+        public int BranchId { get; set; }
+        public string Name { get; set; } = string.Empty;
+        public int SortOrder { get; set; } = 0;
+    }
+
+    // Catering: sale quotation (becomes a sale order later)
+    public class SaleQuote : BaseEntity
+    {
+        public int BranchId { get; set; }
+        public string QuoteNumber { get; set; } = string.Empty;
+        public string PublicToken { get; set; } = string.Empty;   // secret part of the PDF link sent on WhatsApp
+        public int CustomerId { get; set; }
+        public DateTime QuoteDate { get; set; }
+        public DateTime? ValidUntil { get; set; }
+        public DateTime? EventDate { get; set; }
+        public string? EventTime { get; set; }
+        public string? EventType { get; set; }
+        public string? Venue { get; set; }
+        public int? GuestCount { get; set; }
+        public decimal SubTotal { get; set; }
+        public decimal DiscountAmount { get; set; }
+        public decimal TaxPercent { get; set; }
+        public decimal TaxAmount { get; set; }
+        public decimal ServiceCharge { get; set; }          // delivery / setup / service
+        public decimal TotalAmount { get; set; }
+        public decimal AdvanceAmount { get; set; }          // advance payment asked from the customer
+        public string Status { get; set; } = "Saved";       // Saved | Sent | Accepted | Rejected | Converted | Cancelled
+        public string? Notes { get; set; }
+        public string? Terms { get; set; }
+        public byte[]? PdfData { get; set; }                // PDF made by the browser, served to the customer by link
+        public DateTime? PdfUpdatedAt { get; set; }
+        public DateTime? SentAt { get; set; }
+        public int CreatedByUserId { get; set; }
+        public Customer? Customer { get; set; }
+        public ICollection<SaleQuoteItem> Items { get; set; } = new List<SaleQuoteItem>();
+    }
+
+    public class SaleQuoteItem
+    {
+        public int Id { get; set; }
+        public int SaleQuoteId { get; set; }
+        public int? ProductId { get; set; }
+        public string ProductName { get; set; } = string.Empty;   // name when the quote was made
+        public string? UnitName { get; set; }
+        public decimal Quantity { get; set; }
+        public decimal UnitPrice { get; set; }
+        public decimal LineTotal { get; set; }
+        public string? Notes { get; set; }
+        public int SortOrder { get; set; }
     }
 
     // Product type ids (rows are seeded in the ProductTypes table)
@@ -549,6 +604,40 @@ namespace POS.Core.DTOs
     public record OpenDayDto(DateTime? BusinessDate, decimal OpeningBalance, string? Notes);
     public record CloseDayDto(decimal ClosingBalance, string? Notes);
     public record ProductComponentDto(int ComponentProductId, decimal Quantity);
+    public class SaleQuoteItemDto
+    {
+        public int? ProductId { get; set; }
+        public string ProductName { get; set; } = string.Empty;
+        public string? UnitName { get; set; }
+        public decimal Quantity { get; set; }
+        public decimal UnitPrice { get; set; }
+        public string? Notes { get; set; }
+    }
+
+    public class SaleQuoteDto
+    {
+        public int CustomerId { get; set; }
+        public DateTime? QuoteDate { get; set; }
+        public DateTime? ValidUntil { get; set; }
+        public DateTime? EventDate { get; set; }
+        public string? EventTime { get; set; }
+        public string? EventType { get; set; }
+        public string? Venue { get; set; }
+        public int? GuestCount { get; set; }
+        public decimal DiscountAmount { get; set; }
+        public decimal TaxPercent { get; set; }
+        public decimal ServiceCharge { get; set; }
+        public decimal AdvanceAmount { get; set; }
+        public string? Notes { get; set; }
+        public string? Terms { get; set; }
+        public List<SaleQuoteItemDto> Items { get; set; } = new();
+    }
+
+    public record QuotePdfDto(string PdfBase64);
+    public record QuoteStatusDto(string Status);
+    public record ProductClassDto(string Name, int SortOrder);
+    public record ProductClassProductsDto(List<int> ProductIds);
+    public record ExpenseCategoryDto(string Name, string? Icon);
     public record SalesAgentDto(string Name, string? Phone, string AgentType, decimal CommissionAmount);
     public record CustomerDto(string Name, string? Phone, string? Email, string? Address, decimal CreditLimit);
     public record CustomerPaymentDto(decimal Amount, string? Notes);

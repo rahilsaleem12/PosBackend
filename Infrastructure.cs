@@ -44,6 +44,9 @@ namespace POS.Infrastructure.Data
         public DbSet<ProductType> ProductTypes { get; set; }
         public DbSet<ProductComponent> ProductComponents { get; set; }
         public DbSet<CashRegisterSession> CashRegisterSessions { get; set; }
+        public DbSet<ProductClass> ProductClasses { get; set; }
+        public DbSet<SaleQuote> SaleQuotes { get; set; }
+        public DbSet<SaleQuoteItem> SaleQuoteItems { get; set; }
         public DbSet<Order> Orders { get; set; }
         public DbSet<OrderItem> OrderItems { get; set; }
         public DbSet<OrderPayment> OrderPayments { get; set; }
@@ -80,6 +83,45 @@ namespace POS.Infrastructure.Data
                 .HasOne(o => o.Agent)
                 .WithMany()
                 .HasForeignKey(o => o.AgentId)
+                .OnDelete(DeleteBehavior.NoAction);
+
+            // Catering: sale quotes
+            modelBuilder.Entity<SaleQuote>(e =>
+            {
+                e.Property(x => x.QuoteNumber).HasMaxLength(40).IsRequired();
+                e.Property(x => x.PublicToken).HasMaxLength(40).IsRequired();
+                e.Property(x => x.Status).HasMaxLength(20).IsRequired();
+                e.Property(x => x.EventTime).HasMaxLength(20);
+                e.Property(x => x.EventType).HasMaxLength(60);
+                e.Property(x => x.Venue).HasMaxLength(300);
+                e.Property(x => x.Notes).HasMaxLength(1000);
+                e.Property(x => x.Terms).HasMaxLength(2000);
+                e.Property(x => x.QuoteDate).HasColumnType("date");
+                e.Property(x => x.ValidUntil).HasColumnType("date");
+                e.Property(x => x.EventDate).HasColumnType("date");
+                e.HasIndex(x => new { x.BranchId, x.QuoteNumber }).IsUnique();
+                e.HasIndex(x => x.PublicToken).IsUnique();
+                e.HasOne(x => x.Customer).WithMany().HasForeignKey(x => x.CustomerId).OnDelete(DeleteBehavior.NoAction);
+                e.HasMany(x => x.Items).WithOne().HasForeignKey(i => i.SaleQuoteId).OnDelete(DeleteBehavior.Cascade);
+            });
+            modelBuilder.Entity<SaleQuoteItem>(e =>
+            {
+                e.Property(x => x.ProductName).HasMaxLength(200).IsRequired();
+                e.Property(x => x.UnitName).HasMaxLength(30);
+                e.Property(x => x.Notes).HasMaxLength(300);
+                e.HasOne<Product>().WithMany().HasForeignKey(x => x.ProductId).OnDelete(DeleteBehavior.NoAction);
+            });
+
+            // Product classes (KOT break-up)
+            modelBuilder.Entity<ProductClass>(e =>
+            {
+                e.Property(x => x.Name).HasMaxLength(100).IsRequired();
+                e.HasIndex(x => new { x.BranchId, x.Name });
+            });
+            modelBuilder.Entity<Product>()
+                .HasOne<ProductClass>()
+                .WithMany()
+                .HasForeignKey(p => p.ProductClassId)
                 .OnDelete(DeleteBehavior.NoAction);
 
             // Business day (day open / close) — existing CashRegisterSessions table

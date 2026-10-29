@@ -191,7 +191,7 @@ namespace POS.API.Controllers
             return Ok(ApiResponse<IEnumerable<Product>>.Ok(items));
         }
 
-        [Authorize(Roles = "Admin,Manager")]
+        [Authorize(Roles = "Admin,Manager,Catering")]
         [HttpPost]
         public async Task<IActionResult> Create([FromBody] CreateProductDto dto)
         {
@@ -224,7 +224,7 @@ namespace POS.API.Controllers
                 ApiResponse<Product>.Ok(product, "Product created"));
         }
 
-        [Authorize(Roles = "Admin,Manager")]
+        [Authorize(Roles = "Admin,Manager,Catering")]
         [HttpPut("{id}")]
         public async Task<IActionResult> Update(int id, [FromBody] CreateProductDto dto)
         {
@@ -745,6 +745,452 @@ namespace POS.API.Controllers
     }
 
     // ============================================
+    // SALE QUOTES CONTROLLER (Catering)
+    // ============================================
+    [Authorize(Roles = "Admin,Manager,Catering")]
+    [Route("api/sale-quotes")]
+    [ApiController]
+    public class SaleQuotesController : BaseController
+    {
+        private static readonly string[] StatusList = { "Saved", "Sent", "Accepted", "Rejected" };
+        private const int MaxPdfBytes = 3 * 1024 * 1024;   // 3 MB
+        private readonly PosDbContext _db;
+        public SaleQuotesController(PosDbContext db) => _db = db;
+
+        // GET api/sale-quotes?startDate=&endDate=&status=&search=
+        [HttpGet]
+        public async Task<IActionResult> GetAll(
+            [FromQuery] DateTime? startDate = null,
+            [FromQuery] DateTime? endDate = null,
+            [FromQuery] string? status = null,
+            [FromQuery] string? search = null,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 50)
+        {
+            var query = _db.SaleQuotes.AsNoTracking()
+                .Where(q => q.BranchId == CurrentBranchId && q.IsActive);
+
+            if (startDate.HasValue) query = query.Where(q => q.QuoteDate >= startDate.Value.Date);
+            if (endDate.HasValue) query = query.Where(q => q.QuoteDate <= endDate.Value.Date);
+            if (!string.IsNullOrEmpty(status)) query = query.Where(q => q.Status == status);
+            if (!string.IsNullOrEmpty(search))
+                query = query.Where(q => q.QuoteNumber.Contains(search) || q.Customer!.Name.Contains(search));
+
+            var total = await query.CountAsync();
+            var items = await query
+                .OrderByDescending(q => q.QuoteDate).ThenByDescending(q => q.Id)
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .Select(q => new
+                {
+                    q.Id, q.QuoteNumber, q.QuoteDate, q.ValidUntil, q.EventDate, q.CustomerId,
+                    customerName = q.Customer!.Name,
+                    customerPhone = q.Customer.Phone,
+                    q.TotalAmount, q.Status, q.SentAt,
+                    hasPdf = q.PdfData != null
+                })
+                .ToListAsync();
+
+            return Ok(ApiResponse<object>.Ok(items, totalCount: total));
+        }
+
+        // GET api/sale-quotes/5 -> full quote with items and customer (the PDF bytes are not sent)
+        [HttpGet("{id}")]
+        public async Task<IActionResult> GetById(int id)
+        {
+            var quote = await _db.SaleQuotes.AsNoTracking()
+                .Where(x => x.Id == id && x.BranchId == CurrentBranchId && x.IsActive)
+                .Select(x => new
+                {
+                    x.Id, x.QuoteNumber, x.PublicToken, x.CustomerId,
+                    customer = new { x.Customer!.Id, x.Customer.Name, x.Customer.Phone, x.Customer.Address, x.Customer.Email },
+                    x.QuoteDate, x.ValidUntil, x.EventDate, x.EventTime, x.EventType, x.Venue, x.GuestCount,
+                    x.SubTotal, x.DiscountAmount, x.TaxPercent, x.TaxAmount, x.ServiceCharge, x.TotalAmount, x.AdvanceAmount,
+                    x.Status, x.Notes, x.Terms, x.SentAt,
+                    hasPdf = x.PdfData != null,
+                    items = x.Items.OrderBy(i => i.SortOrder)
+                        .Select(i => new { i.Id, i.ProductId, i.ProductName, i.UnitName, i.Quantity, i.UnitPrice, i.LineTotal, i.Notes })
+                        .ToList()
+                })
+                .FirstOrDefaultAsync();
+
+            if (quote == null) return NotFound(ApiResponse<object>.Fail("Quote not found"));
+            return Ok(ApiResponse<object>.Ok(quote));
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> Create([FromBody] SaleQuoteDto dto)
+        {
+            var error = await ValidateAsync(dto);
+            if (error != null) return BadRequest(ApiResponse<object>.Fail(error));
+
+            var quoteDate = (dto.QuoteDate ?? BusinessTime.LocalToday()).Date;
+
+            // QT-20261024-0001 (next free number of that day)
+            var prefix = $"QT-{quoteDate:yyyyMMdd}-";
+            var n = await _db.SaleQuotes.CountAsync(q => q.BranchId == CurrentBranchId && q.QuoteNumber.StartsWith(prefix)) + 1;
+            string number;
+            do
+            {
+                number = $"{prefix}{n:0000}";
+                n++;
+            } while (await _db.SaleQuotes.AnyAsync(q => q.BranchId == CurrentBranchId && q.QuoteNumber == number));
+
+            var quote = new SaleQuote
+            {
+                BranchId = CurrentBranchId,
+                QuoteNumber = number,
+                PublicToken = Guid.NewGuid().ToString("N"),
+                QuoteDate = quoteDate,
+                Status = "Saved",
+                CreatedByUserId = CurrentUserId
+            };
+            await Apply(quote, dto);
+
+            _db.SaleQuotes.Add(quote);
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<object>.Ok(new { quote.Id, quote.QuoteNumber, quote.PublicToken, quote.TotalAmount, quote.Status }, "Quote saved"));
+        }
+
+        [HttpPut("{id}")]
+        public async Task<IActionResult> Update(int id, [FromBody] SaleQuoteDto dto)
+        {
+            var quote = await _db.SaleQuotes.Include(q => q.Items)
+                .FirstOrDefaultAsync(q => q.Id == id && q.BranchId == CurrentBranchId && q.IsActive);
+            if (quote == null) return NotFound(ApiResponse<object>.Fail("Quote not found"));
+            if (quote.Status == "Converted")
+                return BadRequest(ApiResponse<object>.Fail("This quote is already converted to a sale order"));
+
+            var error = await ValidateAsync(dto);
+            if (error != null) return BadRequest(ApiResponse<object>.Fail(error));
+
+            _db.SaleQuoteItems.RemoveRange(quote.Items.ToList());
+            quote.Items = new List<SaleQuoteItem>();
+            if (dto.QuoteDate.HasValue) quote.QuoteDate = dto.QuoteDate.Value.Date;
+            await Apply(quote, dto);
+
+            // the saved PDF no longer matches: it is made again when the quote is sent
+            quote.PdfData = null;
+            quote.PdfUpdatedAt = null;
+            if (quote.Status != "Saved") quote.Status = "Saved";
+            quote.UpdatedAt = DateTime.UtcNow;
+
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<object>.Ok(new { quote.Id, quote.QuoteNumber, quote.PublicToken, quote.TotalAmount, quote.Status }, "Quote updated"));
+        }
+
+        // PUT api/sale-quotes/5/pdf  { pdfBase64 }
+        [HttpPut("{id}/pdf")]
+        public async Task<IActionResult> SavePdf(int id, [FromBody] QuotePdfDto dto)
+        {
+            var quote = await _db.SaleQuotes.FirstOrDefaultAsync(q => q.Id == id && q.BranchId == CurrentBranchId && q.IsActive);
+            if (quote == null) return NotFound(ApiResponse<object>.Fail("Quote not found"));
+
+            byte[] bytes;
+            try { bytes = Convert.FromBase64String(dto.PdfBase64 ?? string.Empty); }
+            catch { return BadRequest(ApiResponse<object>.Fail("Invalid PDF data")); }
+
+            if (bytes.Length < 100 || bytes.Length > MaxPdfBytes)
+                return BadRequest(ApiResponse<object>.Fail("PDF size is not valid (maximum 3 MB)"));
+            if (bytes[0] != 0x25 || bytes[1] != 0x50 || bytes[2] != 0x44 || bytes[3] != 0x46)   // "%PDF"
+                return BadRequest(ApiResponse<object>.Fail("The file is not a PDF"));
+
+            quote.PdfData = bytes;
+            quote.PdfUpdatedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<object>.Ok(new { quote.Id, quote.PublicToken }, "PDF saved"));
+        }
+
+        // POST api/sale-quotes/5/sent  -> the quote was sent to the customer (WhatsApp)
+        [HttpPost("{id}/sent")]
+        public async Task<IActionResult> MarkSent(int id)
+        {
+            var quote = await _db.SaleQuotes.FirstOrDefaultAsync(q => q.Id == id && q.BranchId == CurrentBranchId && q.IsActive);
+            if (quote == null) return NotFound(ApiResponse<object>.Fail("Quote not found"));
+
+            quote.SentAt = DateTime.UtcNow;
+            if (quote.Status == "Saved") quote.Status = "Sent";
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<object>.Ok(new { quote.Id, quote.Status, quote.SentAt }));
+        }
+
+        // POST api/sale-quotes/5/status  { status: Accepted | Rejected | Sent | Saved }
+        [HttpPost("{id}/status")]
+        public async Task<IActionResult> SetStatus(int id, [FromBody] QuoteStatusDto dto)
+        {
+            if (!StatusList.Contains(dto.Status))
+                return BadRequest(ApiResponse<object>.Fail("Invalid status"));
+
+            var quote = await _db.SaleQuotes.FirstOrDefaultAsync(q => q.Id == id && q.BranchId == CurrentBranchId && q.IsActive);
+            if (quote == null) return NotFound(ApiResponse<object>.Fail("Quote not found"));
+            if (quote.Status == "Converted")
+                return BadRequest(ApiResponse<object>.Fail("This quote is already converted to a sale order"));
+
+            quote.Status = dto.Status;
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<object>.Ok(new { quote.Id, quote.Status }));
+        }
+
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> Delete(int id)
+        {
+            var quote = await _db.SaleQuotes.FirstOrDefaultAsync(q => q.Id == id && q.BranchId == CurrentBranchId && q.IsActive);
+            if (quote == null) return NotFound(ApiResponse<object>.Fail("Quote not found"));
+            if (quote.Status == "Converted")
+                return BadRequest(ApiResponse<object>.Fail("This quote is already converted to a sale order"));
+
+            quote.IsActive = false;      // kept in the database, hidden from the list
+            quote.PdfData = null;        // the old link stops working
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<object>.Ok(null!, "Quote deleted"));
+        }
+
+        // ---------- helpers ----------
+        private async Task<string?> ValidateAsync(SaleQuoteDto dto)
+        {
+            var customerOk = await _db.Customers.AnyAsync(c => c.Id == dto.CustomerId && c.BranchId == CurrentBranchId && c.IsActive);
+            if (!customerOk) return "Please select a customer";
+            if (dto.Items == null || dto.Items.Count == 0) return "Add at least one item to the quote";
+            if (dto.Items.Count > 200) return "A quote can have up to 200 items";
+            if (dto.Items.Any(i => string.IsNullOrWhiteSpace(i.ProductName))) return "Every item needs a name";
+            if (dto.Items.Any(i => i.Quantity <= 0)) return "Quantity must be greater than zero";
+            if (dto.Items.Any(i => i.UnitPrice < 0)) return "Price cannot be negative";
+            if (dto.GuestCount.HasValue && dto.GuestCount.Value < 0) return "Guest count cannot be negative";
+            return null;
+        }
+
+        // Copies the screen data into the quote and works out the totals on the server
+        private async Task Apply(SaleQuote quote, SaleQuoteDto dto)
+        {
+            // products that still exist (looked up in memory, no list.Contains in SQL)
+            var productIds = (await _db.Products.AsNoTracking()
+                .Where(p => p.BranchId == CurrentBranchId)
+                .Select(p => p.Id)
+                .ToListAsync()).ToHashSet();
+
+            var sort = 0;
+            foreach (var i in dto.Items)
+            {
+                var qty = Math.Round(i.Quantity, 3);
+                var price = Math.Round(i.UnitPrice, 2);
+                quote.Items.Add(new SaleQuoteItem
+                {
+                    ProductId = i.ProductId.HasValue && productIds.Contains(i.ProductId.Value) ? i.ProductId : null,
+                    ProductName = i.ProductName.Trim(),
+                    UnitName = string.IsNullOrWhiteSpace(i.UnitName) ? null : i.UnitName.Trim(),
+                    Quantity = qty,
+                    UnitPrice = price,
+                    LineTotal = Math.Round(qty * price, 2),
+                    Notes = string.IsNullOrWhiteSpace(i.Notes) ? null : i.Notes.Trim(),
+                    SortOrder = sort++
+                });
+            }
+
+            var subTotal = quote.Items.Sum(i => i.LineTotal);
+            var discount = Math.Min(Math.Max(dto.DiscountAmount, 0), subTotal);
+            var taxPercent = Math.Clamp(dto.TaxPercent, 0, 100);
+            var taxable = subTotal - discount;
+            var tax = Math.Round(taxable * taxPercent / 100m, 2);
+            var service = Math.Max(dto.ServiceCharge, 0);
+            var total = taxable + tax + service;
+
+            quote.CustomerId = dto.CustomerId;
+            quote.ValidUntil = dto.ValidUntil?.Date;
+            quote.EventDate = dto.EventDate?.Date;
+            quote.EventTime = Trim(dto.EventTime, 20);
+            quote.EventType = Trim(dto.EventType, 60);
+            quote.Venue = Trim(dto.Venue, 300);
+            quote.GuestCount = dto.GuestCount;
+            quote.SubTotal = subTotal;
+            quote.DiscountAmount = discount;
+            quote.TaxPercent = taxPercent;
+            quote.TaxAmount = tax;
+            quote.ServiceCharge = service;
+            quote.TotalAmount = total;
+            quote.AdvanceAmount = Math.Min(Math.Max(dto.AdvanceAmount, 0), total);
+            quote.Notes = Trim(dto.Notes, 1000);
+            quote.Terms = Trim(dto.Terms, 2000);
+        }
+
+        private static string? Trim(string? value, int max)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return null;
+            var v = value.Trim();
+            return v.Length > max ? v.Substring(0, max) : v;
+        }
+    }
+
+    // ============================================
+    // PUBLIC QUOTE PDF (opened by the customer from the WhatsApp link — no login)
+    // ============================================
+    [AllowAnonymous]
+    [Route("api/public/sale-quotes")]
+    [ApiController]
+    public class PublicQuotesController : ControllerBase
+    {
+        private readonly PosDbContext _db;
+        public PublicQuotesController(PosDbContext db) => _db = db;
+
+        [HttpGet("{token}/pdf")]
+        public async Task<IActionResult> GetPdf(string token)
+        {
+            if (string.IsNullOrWhiteSpace(token) || token.Length > 40) return NotFound();
+
+            var quote = await _db.SaleQuotes.AsNoTracking()
+                .Where(q => q.PublicToken == token && q.IsActive)
+                .Select(q => new { q.QuoteNumber, q.PdfData })
+                .FirstOrDefaultAsync();
+
+            if (quote == null || quote.PdfData == null) return NotFound();
+
+            Response.Headers["Content-Disposition"] = $"inline; filename=\"Quotation-{quote.QuoteNumber}.pdf\"";
+            Response.Headers["Cache-Control"] = "private, max-age=300";
+            return File(quote.PdfData, "application/pdf");
+        }
+    }
+
+    // ============================================
+    // PRODUCT CLASSES CONTROLLER (KOT break-up)
+    // ============================================
+    [Authorize]
+    [Route("api/product-classes")]
+    [ApiController]
+    public class ProductClassesController : BaseController
+    {
+        private readonly PosDbContext _db;
+        public ProductClassesController(PosDbContext db) => _db = db;
+
+        // GET api/product-classes -> classes with their product ids
+        [HttpGet]
+        public async Task<IActionResult> GetAll()
+        {
+            var classes = await _db.ProductClasses.AsNoTracking()
+                .Where(c => c.BranchId == CurrentBranchId && c.IsActive)
+                .OrderBy(c => c.SortOrder).ThenBy(c => c.Name)
+                .ToListAsync();
+
+            // products that belong to a class (grouped in memory)
+            var members = await _db.Products.AsNoTracking()
+                .Where(p => p.BranchId == CurrentBranchId && p.IsActive && p.ProductClassId != null)
+                .Select(p => new { p.Id, p.ProductClassId })
+                .ToListAsync();
+            var idsByClass = members
+                .GroupBy(m => m.ProductClassId!.Value)
+                .ToDictionary(g => g.Key, g => g.Select(m => m.Id).ToList());
+
+            // productIds lets the POS split the KOT without loading every product (and works offline from a saved copy)
+            var items = classes.Select(c =>
+            {
+                var ids = idsByClass.TryGetValue(c.Id, out var list) ? list : new List<int>();
+                return new { c.Id, c.Name, c.SortOrder, productCount = ids.Count, productIds = ids };
+            }).ToList();
+
+            return Ok(ApiResponse<object>.Ok(items));
+        }
+
+        // GET api/product-classes/5 -> class with the ids of its products
+        [HttpGet("{id}")]
+        public async Task<IActionResult> GetById(int id)
+        {
+            var cls = await _db.ProductClasses.AsNoTracking()
+                .FirstOrDefaultAsync(c => c.Id == id && c.BranchId == CurrentBranchId && c.IsActive);
+            if (cls == null) return NotFound(ApiResponse<object>.Fail("Product class not found"));
+
+            var productIds = await _db.Products.AsNoTracking()
+                .Where(p => p.ProductClassId == id && p.IsActive)
+                .Select(p => p.Id)
+                .ToListAsync();
+
+            return Ok(ApiResponse<object>.Ok(new { cls.Id, cls.Name, cls.SortOrder, productIds }));
+        }
+
+        [Authorize(Roles = "Admin,Manager")]
+        [HttpPost]
+        public async Task<IActionResult> Create([FromBody] ProductClassDto dto)
+        {
+            var name = (dto.Name ?? string.Empty).Trim();
+            if (name.Length == 0) return BadRequest(ApiResponse<ProductClass>.Fail("Name is required"));
+
+            var exists = await _db.ProductClasses.AnyAsync(c =>
+                c.BranchId == CurrentBranchId && c.IsActive && c.Name == name);
+            if (exists) return BadRequest(ApiResponse<ProductClass>.Fail("A product class with this name already exists"));
+
+            var cls = new ProductClass { BranchId = CurrentBranchId, Name = name, SortOrder = dto.SortOrder };
+            _db.ProductClasses.Add(cls);
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<ProductClass>.Ok(cls, "Product class created"));
+        }
+
+        [Authorize(Roles = "Admin,Manager")]
+        [HttpPut("{id}")]
+        public async Task<IActionResult> Update(int id, [FromBody] ProductClassDto dto)
+        {
+            var cls = await _db.ProductClasses.FirstOrDefaultAsync(c => c.Id == id && c.BranchId == CurrentBranchId && c.IsActive);
+            if (cls == null) return NotFound(ApiResponse<ProductClass>.Fail("Product class not found"));
+
+            var name = (dto.Name ?? string.Empty).Trim();
+            if (name.Length == 0) return BadRequest(ApiResponse<ProductClass>.Fail("Name is required"));
+
+            var exists = await _db.ProductClasses.AnyAsync(c =>
+                c.BranchId == CurrentBranchId && c.IsActive && c.Name == name && c.Id != id);
+            if (exists) return BadRequest(ApiResponse<ProductClass>.Fail("A product class with this name already exists"));
+
+            cls.Name = name;
+            cls.SortOrder = dto.SortOrder;
+            cls.UpdatedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<ProductClass>.Ok(cls, "Product class updated"));
+        }
+
+        // Delete: the class is removed and its products go back to "no class"
+        [Authorize(Roles = "Admin,Manager")]
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> Delete(int id)
+        {
+            var cls = await _db.ProductClasses.FirstOrDefaultAsync(c => c.Id == id && c.BranchId == CurrentBranchId && c.IsActive);
+            if (cls == null) return NotFound(ApiResponse<object>.Fail("Product class not found"));
+
+            var members = await _db.Products.Where(p => p.ProductClassId == id).ToListAsync();
+            foreach (var p in members) p.ProductClassId = null;
+
+            cls.IsActive = false;
+            cls.UpdatedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<object>.Ok(null!, "Product class deleted"));
+        }
+
+        // PUT api/product-classes/5/products  { productIds: [...] } -> these products belong to this class.
+        // A product is in one class only: adding it here moves it out of its old class.
+        [Authorize(Roles = "Admin,Manager")]
+        [HttpPut("{id}/products")]
+        public async Task<IActionResult> SetProducts(int id, [FromBody] ProductClassProductsDto dto)
+        {
+            var cls = await _db.ProductClasses.FirstOrDefaultAsync(c => c.Id == id && c.BranchId == CurrentBranchId && c.IsActive);
+            if (cls == null) return NotFound(ApiResponse<object>.Fail("Product class not found"));
+
+            var wanted = new HashSet<int>(dto.ProductIds ?? new List<int>());
+            var members = await _db.Products.Where(p => p.ProductClassId == id).ToListAsync();
+
+            // removed from the class
+            foreach (var p in members.Where(m => !wanted.Contains(m.Id)))
+                p.ProductClassId = null;
+
+            // added to the class (looked up one by one — no list.Contains in SQL)
+            var already = new HashSet<int>(members.Select(m => m.Id));
+            foreach (var productId in wanted.Where(w => !already.Contains(w)))
+            {
+                var p = await _db.Products.FindAsync(productId);
+                if (p == null || p.BranchId != CurrentBranchId) continue;
+                p.ProductClassId = id;
+            }
+
+            await _db.SaveChangesAsync();
+            var count = await _db.Products.CountAsync(p => p.ProductClassId == id && p.IsActive);
+            return Ok(ApiResponse<object>.Ok(new { productCount = count }, "Products saved"));
+        }
+    }
+
+    // ============================================
     // SALES AGENTS CONTROLLER (Waiter / Rider)
     // ============================================
     [Authorize]
@@ -860,7 +1306,7 @@ namespace POS.API.Controllers
             return Ok(ApiResponse<IEnumerable<Supplier>>.Ok(items));
         }
 
-        [Authorize(Roles = "Admin,Manager")]
+        [Authorize(Roles = "Admin,Manager,Catering")]
         [HttpPost]
         public async Task<IActionResult> Create([FromBody] SupplierDto dto)
         {
@@ -878,7 +1324,7 @@ namespace POS.API.Controllers
             return Ok(ApiResponse<Supplier>.Ok(supplier, "Supplier created"));
         }
 
-        [Authorize(Roles = "Admin,Manager")]
+        [Authorize(Roles = "Admin,Manager,Catering")]
         [HttpPut("{id}")]
         public async Task<IActionResult> Update(int id, [FromBody] SupplierDto dto)
         {
@@ -1076,8 +1522,58 @@ namespace POS.API.Controllers
         {
             var cats = await _db.ExpenseCategories
                 .Where(c => c.BranchId == CurrentBranchId && c.IsActive)
+                .OrderBy(c => c.Name)
                 .ToListAsync();
             return Ok(ApiResponse<IEnumerable<ExpenseCategory>>.Ok(cats));
+        }
+
+        [Authorize(Roles = "Admin,Manager")]
+        [HttpPost("categories")]
+        public async Task<IActionResult> CreateCategory([FromBody] ExpenseCategoryDto dto)
+        {
+            var name = (dto.Name ?? string.Empty).Trim();
+            if (name.Length == 0) return BadRequest(ApiResponse<ExpenseCategory>.Fail("Name is required"));
+
+            var exists = await _db.ExpenseCategories.AnyAsync(c =>
+                c.BranchId == CurrentBranchId && c.IsActive && c.Name == name);
+            if (exists) return BadRequest(ApiResponse<ExpenseCategory>.Fail("An expense category with this name already exists"));
+
+            var cat = new ExpenseCategory { BranchId = CurrentBranchId, Name = name, Icon = dto.Icon, IsActive = true };
+            _db.ExpenseCategories.Add(cat);
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<ExpenseCategory>.Ok(cat, "Expense category added"));
+        }
+
+        [Authorize(Roles = "Admin,Manager")]
+        [HttpPut("categories/{id}")]
+        public async Task<IActionResult> UpdateCategory(int id, [FromBody] ExpenseCategoryDto dto)
+        {
+            var cat = await _db.ExpenseCategories.FirstOrDefaultAsync(c => c.Id == id && c.BranchId == CurrentBranchId);
+            if (cat == null) return NotFound(ApiResponse<ExpenseCategory>.Fail("Expense category not found"));
+
+            var name = (dto.Name ?? string.Empty).Trim();
+            if (name.Length == 0) return BadRequest(ApiResponse<ExpenseCategory>.Fail("Name is required"));
+
+            var exists = await _db.ExpenseCategories.AnyAsync(c =>
+                c.BranchId == CurrentBranchId && c.IsActive && c.Name == name && c.Id != id);
+            if (exists) return BadRequest(ApiResponse<ExpenseCategory>.Fail("An expense category with this name already exists"));
+
+            cat.Name = name;
+            cat.Icon = dto.Icon;
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<ExpenseCategory>.Ok(cat, "Expense category updated"));
+        }
+
+        [Authorize(Roles = "Admin,Manager")]
+        [HttpDelete("categories/{id}")]
+        public async Task<IActionResult> DeleteCategory(int id)
+        {
+            var cat = await _db.ExpenseCategories.FirstOrDefaultAsync(c => c.Id == id && c.BranchId == CurrentBranchId);
+            if (cat == null) return NotFound(ApiResponse<object>.Fail("Expense category not found"));
+
+            cat.IsActive = false;   // old expenses keep their category name
+            await _db.SaveChangesAsync();
+            return Ok(ApiResponse<object>.Ok(null!, "Expense category deleted"));
         }
     }
 
